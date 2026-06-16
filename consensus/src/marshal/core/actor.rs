@@ -7,9 +7,11 @@ use crate::{
     marshal::{
         resolver::handler::{self, Request},
         store::{Blocks, Certificates},
-        anchor_first_deliver_should_notify, classify_pending_kind, forward_fill_start,
-        is_epoch_boundary, is_recovery_completion_deliver, Config, EmergencyQcVerifier,
-        Identifier as BlockID, PendingGap, RecoverySwitchComplete,
+        forward_fill_start,
+        is_recovery_completion_deliver, should_cache_recovery_out_of_order,
+        should_notify_recovery_execution, should_store_execution_after_switch,
+        should_skip_backward_gap_repair, Config, EmergencyQcVerifier,
+        Identifier as BlockID, PendingGap, RecoveryAwaiting, RecoverySwitchComplete,
         RecoverySwitchNotifier, RecoverySyncGate, Update,
     },
     simplex::{
@@ -27,7 +29,7 @@ use commonware_cryptography::{
 };
 use commonware_macros::select_loop;
 use commonware_parallel::Strategy;
-use commonware_resolver::{Resolver, DeliverOutcome};
+use commonware_resolver::Resolver;
 use commonware_runtime::{
     spawn_cell, telemetry::metrics::status::GaugeExt, BufferPooler, Clock, ContextCell, Handle,
     Metrics, Spawner, Storage,
@@ -61,17 +63,18 @@ const LATEST_KEY: U64 = U64::new(0xFF);
 
 /// Outcome of recovery deliver evaluation in [`Actor::evaluate_recovery_finalized`].
 enum RecoveryDeliverDecision {
+    /// Proceed to store (replay, completion, or sequential catch-up already applied).
     Store,
+    /// Cache in archive now; notify/evaluate when `height == last_processed + 1`.
+    StoreOnly,
+    /// Do not store; resolver should retry (awaiting switch, notify sent).
     Deferred,
 }
 
-/// Outcome of verifying a resolver delivery.
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum VerifyStatus {
-    Pending,
-    Accepted,
-    RecoveryQcOk,
-    Deferred,
+/// Whether recovery evaluation runs on a network deliver or sequential catch-up.
+enum RecoveryDeliverKind {
+    NetworkDeliver,
+    SequentialCatchUp,
 }
 
 /// A parsed-but-unverified resolver delivery awaiting batch certificate verification.
@@ -79,12 +82,12 @@ enum PendingVerification<S: CertificateScheme, V: Variant> {
     Notarized {
         notarization: Notarization<S, V::Commitment>,
         block: V::Block,
-        response: oneshot::Sender<DeliverOutcome>,
+        response: oneshot::Sender<bool>,
     },
     Finalized {
         finalization: Finalization<S, V::Commitment>,
         block: V::Block,
-        response: oneshot::Sender<DeliverOutcome>,
+        response: oneshot::Sender<bool>,
     },
 }
 
@@ -256,8 +259,6 @@ where
     emergency_qc_verifier: Q,
     // Notifies recovery switch before storing recovery blocks
     recovery_notifier: RN,
-    // Epoch length for boundary detection (0 = disabled)
-    epoch_length: u64,
     // Recovery gap-sync gate
     recovery_gate: RecoverySyncGate,
     // Deferred recovery switch completion from mailbox (processed on resolver arm)
@@ -376,7 +377,6 @@ where
                 strategy: config.strategy,
                 emergency_qc_verifier: config.emergency_qc_verifier,
                 recovery_notifier: config.recovery_notifier,
-                epoch_length: config.epoch_length,
                 recovery_gate: RecoverySyncGate::default(),
                 pending_switch_complete: None,
                 last_processed_round: Round::zero(),
@@ -762,6 +762,9 @@ where
                 if let Some(complete) = self.pending_switch_complete.take() {
                     self.handle_recovery_switch_complete(complete, &mut resolver)
                         .await;
+                    self.try_advance_recovery_at_next_height()
+                        .await;
+                    self.try_dispatch_blocks(&mut application).await;
                 }
 
                 // Drain up to max_repair messages: blocks handled immediately,
@@ -798,7 +801,7 @@ where
 
                 // Batch verify and process all delivers.
                 needs_sync |= self
-                    .verify_delivered(delivers, &mut application, &mut buffer, &mut resolver)
+                    .verify_delivered(delivers, &mut application, &mut buffer)
                     .await;
 
                 // Attempt to fill gaps before handling produce requests (so we
@@ -957,7 +960,7 @@ where
         &mut self,
         key: Request<V::Commitment>,
         value: Bytes,
-        response: oneshot::Sender<DeliverOutcome>,
+        response: oneshot::Sender<bool>,
         delivers: &mut Vec<PendingVerification<P::Scheme, V>>,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
         buffer: &mut Buf,
@@ -966,11 +969,11 @@ where
             Request::Block(commitment) => {
                 let Ok(block) = V::Block::decode_cfg(value.as_ref(), &self.block_codec_config)
                 else {
-                    response.send_lossy(DeliverOutcome::Rejected);
+                    response.send_lossy(false);
                     return false;
                 };
                 if V::commitment(&block) != commitment {
-                    response.send_lossy(DeliverOutcome::Rejected);
+                    response.send_lossy(false);
                     return false;
                 }
 
@@ -983,12 +986,12 @@ where
                     .await;
                 debug!(?digest, %height, "received block");
                 // If a valid block is received, we should still accept (even if it was stale).
-                response.send_lossy(DeliverOutcome::Accepted);
+                response.send_lossy(true);
                 wrote
             }
             Request::Finalized { height } => {
                 let Some(bounds) = self.epocher.containing(height) else {
-                    response.send_lossy(DeliverOutcome::Rejected);
+                    response.send_lossy(false);
                     return false;
                 };
                 let Some(scheme) = self.get_scheme_certificate_verifier(bounds.epoch()) else {
@@ -997,7 +1000,7 @@ where
                         epoch = %bounds.epoch(),
                         "deferring finalized deliver until epoch scheme is registered",
                     );
-                    response.send_lossy(DeliverOutcome::Deferred);
+                    response.send_lossy(true);
                     return false;
                 };
                 let Ok((finalization, block)) =
@@ -1009,7 +1012,7 @@ where
                         ),
                     )
                 else {
-                    response.send_lossy(DeliverOutcome::Rejected);
+                    response.send_lossy(false);
                     return false;
                 };
 
@@ -1019,7 +1022,7 @@ where
                     || V::commitment(&block) != commitment
                     || finalization.epoch() != bounds.epoch()
                 {
-                    response.send_lossy(DeliverOutcome::Rejected);
+                    response.send_lossy(false);
                     return false;
                 }
                 delivers.push(PendingVerification::Finalized {
@@ -1036,7 +1039,7 @@ where
                         epoch = %round.epoch(),
                         "deferring notarized deliver until epoch scheme is registered",
                     );
-                    response.send_lossy(DeliverOutcome::Deferred);
+                    response.send_lossy(true);
                     return false;
                 };
 
@@ -1049,14 +1052,14 @@ where
                         ),
                     )
                 else {
-                    response.send_lossy(DeliverOutcome::Rejected);
+                    response.send_lossy(false);
                     return false;
                 };
 
                 if notarization.round() != round
                     || V::commitment(&block) != notarization.proposal.payload
                 {
-                    response.send_lossy(DeliverOutcome::Rejected);
+                    response.send_lossy(false);
                     return false;
                 }
                 delivers.push(PendingVerification::Notarized {
@@ -1071,22 +1074,20 @@ where
 
     /// Batch verify pending certificates and process valid items. Returns true
     /// if finalization archives were written and need syncing.
-    async fn verify_delivered<Buf, Res>(
+    async fn verify_delivered<Buf>(
         &mut self,
         mut delivers: Vec<PendingVerification<P::Scheme, V>>,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
         buffer: &mut Buf,
-        resolver: &mut Res,
     ) -> bool
     where
         Buf: Buffer<V>,
-        Res: Resolver<Key = Request<V::Commitment>>,
     {
         if delivers.is_empty() {
             return false;
         }
 
-        let mut status = vec![VerifyStatus::Pending; delivers.len()];
+        let mut verified = vec![false; delivers.len()];
         for (index, item) in delivers.iter().enumerate() {
             let (kind, height, extra) = match item {
                 PendingVerification::Finalized { block, .. } => (
@@ -1105,7 +1106,7 @@ where
                 .verify_emergency_extra_data(extra, height.get())
             {
                 Some(true) => {
-                    status[index] = VerifyStatus::RecoveryQcOk;
+                    verified[index] = true;
                     info!(
                         target: "marshal.emergency",
                         %index,
@@ -1129,10 +1130,10 @@ where
             }
         }
 
-        let pending_cert: Vec<usize> = status
+        let pending_cert: Vec<usize> = verified
             .iter()
             .enumerate()
-            .filter_map(|(index, s)| (*s == VerifyStatus::Pending).then_some(index))
+            .filter_map(|(index, ok)| (!*ok).then_some(index))
             .collect();
 
         if !pending_cert.is_empty() {
@@ -1163,15 +1164,7 @@ where
                     &self.strategy,
                 );
                 for (j, &index) in pending_cert.iter().enumerate() {
-                    status[index] = if results[j] {
-                        VerifyStatus::Accepted
-                    } else {
-                        debug!(
-                            %index,
-                            "verify_delivered: BLS verification failed; deferring without blocking peer",
-                        );
-                        VerifyStatus::Deferred
-                    };
+                    verified[index] = results[j];
                 }
             } else {
                 let mut by_epoch: BTreeMap<Epoch, Vec<usize>> = BTreeMap::new();
@@ -1189,15 +1182,6 @@ where
 
                 for (epoch, indices) in &by_epoch {
                     let Some(scheme) = self.provider.scoped(*epoch) else {
-                        for &j in indices {
-                            let index = pending_cert[j];
-                            debug!(
-                                %index,
-                                %epoch,
-                                "verify_delivered: missing epoch scheme; deferring without blocking peer",
-                            );
-                            status[index] = VerifyStatus::Deferred;
-                        }
                         continue;
                     };
                     let group: Vec<_> = indices.iter().map(|&j| certs[pending_cert[j]]).collect();
@@ -1208,17 +1192,7 @@ where
                         &self.strategy,
                     );
                     for (k, &j) in indices.iter().enumerate() {
-                        let index = pending_cert[j];
-                        status[index] = if results[k] {
-                            VerifyStatus::Accepted
-                        } else {
-                            debug!(
-                                %index,
-                                %epoch,
-                                "verify_delivered: BLS verification failed; deferring without blocking peer",
-                            );
-                            VerifyStatus::Deferred
-                        };
+                        verified[pending_cert[j]] = results[k];
                     }
                 }
             }
@@ -1227,15 +1201,11 @@ where
         // Process each verified item, deferring or rejecting the rest.
         let mut wrote = false;
         for (index, item) in delivers.drain(..).enumerate() {
-            let cert_ok = matches!(
-                status[index],
-                VerifyStatus::Accepted | VerifyStatus::RecoveryQcOk
-            );
-            if !cert_ok {
+            if !verified[index] {
                 match item {
                     PendingVerification::Finalized { response, .. }
                     | PendingVerification::Notarized { response, .. } => {
-                        response.send_lossy(DeliverOutcome::Deferred);
+                        response.send_lossy(false);
                     }
                 }
                 continue;
@@ -1249,37 +1219,36 @@ where
                     let extra = block.extra_data();
                     let height = block.height();
                     if self.emergency_qc_verifier.has_recovery_slots(extra) {
-                        if matches!(
-                            self
-                                .evaluate_recovery_finalized(
-                                    extra,
-                                    height,
-                                    &response,
-                                    resolver,
-                                )
-                                .await,
-                            RecoveryDeliverDecision::Deferred
-                        ) {
-                            response.send_lossy(DeliverOutcome::Deferred);
-                            continue;
+                        match self
+                            .evaluate_recovery_finalized(
+                                extra,
+                                height,
+                                RecoveryDeliverKind::NetworkDeliver,
+                            )
+                            .await
+                        {
+                            RecoveryDeliverDecision::Deferred => {
+                                response.send_lossy(true);
+                                continue;
+                            }
+                            RecoveryDeliverDecision::StoreOnly | RecoveryDeliverDecision::Store => {}
                         }
                     }
 
                     // Valid finalization received.
-                    response.send_lossy(DeliverOutcome::Accepted);
+                    response.send_lossy(true);
                     let round = finalization.round();
                     let digest = block.digest();
                     debug!(?round, %height, "received finalization");
 
-                    let completion = is_recovery_completion_deliver(
-                        height.get(),
-                        self.last_processed_height.get(),
-                        &self.recovery_gate.pending_gap,
-                        self.recovery_gate.awaiting.is_some(),
-                        self.emergency_qc_verifier
-                            .parse_recovery_identity(extra),
-                        &self.recovery_gate.last_applied_recovery,
-                    );
+                    let completion = !self.recovery_gate.awaiting.is_some()
+                        && self.recovery_gate.pending_gap.as_ref().is_some_and(|gap| {
+                            is_recovery_completion_deliver(
+                                height.get(),
+                                self.last_processed_height.get(),
+                                gap,
+                            )
+                        });
                     if completion {
                         info!(
                             target: "marshal.emergency",
@@ -1307,7 +1276,7 @@ where
                     response,
                 } => {
                     // Valid notarization received.
-                    response.send_lossy(DeliverOutcome::Accepted);
+                    response.send_lossy(true);
                     let round = notarization.round();
                     let commitment = notarization.proposal.payload;
                     let digest = V::commitment_to_inner(commitment);
@@ -1345,109 +1314,79 @@ where
         wrote
     }
 
-    async fn evaluate_recovery_finalized<Res>(
+    async fn evaluate_recovery_finalized(
         &mut self,
         extra: &[u8],
         height: Height,
-        _response: &oneshot::Sender<DeliverOutcome>,
-        resolver: &mut Res,
-    ) -> RecoveryDeliverDecision
-    where
-        Res: Resolver<Key = Request<V::Commitment>>,
-    {
-        let height_u = height.get();
-        let last_processed = self.last_processed_height.get();
-        let identity = self.emergency_qc_verifier.parse_recovery_identity(extra);
-        let failing_height = identity
-            .as_ref()
-            .map(|id| id.failing_height)
-            .unwrap_or(height_u);
-
+        kind: RecoveryDeliverKind,
+    ) -> RecoveryDeliverDecision {
         if self.recovery_gate.awaiting.is_some() {
-            debug!(
-                target: "marshal.emergency",
-                %height_u,
-                "evaluate_recovery_finalized: awaiting switch, deferring deliver",
-            );
             return RecoveryDeliverDecision::Deferred;
         }
 
-        if is_recovery_completion_deliver(
-            height_u,
-            last_processed,
-            &self.recovery_gate.pending_gap,
-            false,
-            identity.clone(),
-            &self.recovery_gate.last_applied_recovery,
-        ) {
+        let height_u = height.get();
+        let last_processed = self.last_processed_height.get();
+        let failing_height = self
+            .emergency_qc_verifier
+            .parse_recovery_failing_height(extra)
+            .unwrap_or(height_u);
+
+        if self.recovery_gate.pending_gap.as_ref().is_some_and(|gap| {
+            is_recovery_completion_deliver(height_u, last_processed, gap)
+        }) {
             return RecoveryDeliverDecision::Store;
         }
 
-        if identity.as_ref() == self.recovery_gate.last_applied_recovery.as_ref() {
+        if self.recovery_gate.pending_gap.as_ref().is_some_and(|gap| {
+            should_store_execution_after_switch(
+                gap.switch_completed,
+                last_processed,
+                height_u,
+                gap.failing_height,
+            )
+        }) {
             return RecoveryDeliverDecision::Store;
         }
 
-        let is_boundary =
-            self.epoch_length > 0 && is_epoch_boundary(height_u, self.epoch_length);
+        if matches!(kind, RecoveryDeliverKind::NetworkDeliver)
+            && should_cache_recovery_out_of_order(
+                last_processed,
+                height_u,
+                self.recovery_gate.pending_gap.is_some(),
+            )
+        {
+            return RecoveryDeliverDecision::StoreOnly;
+        }
 
         if self.recovery_gate.pending_gap.is_none() {
-            let kind = classify_pending_kind(height_u, failing_height, self.epoch_length);
-            let fill_start = forward_fill_start(
-                last_processed,
-                last_processed.saturating_add(1).max(1),
-                &PendingGap {
-                    recovery_target: height_u,
-                    failing_height,
-                    kind,
-                    fill_start: 0,
-                },
-            );
             self.recovery_gate.pending_gap = Some(PendingGap {
                 recovery_target: height_u,
                 failing_height,
-                kind,
-                fill_start,
+                fill_start: forward_fill_start(
+                    last_processed,
+                    last_processed.saturating_add(1).max(1),
+                    failing_height,
+                ),
+                switch_completed: false,
             });
 
-            if !anchor_first_deliver_should_notify(last_processed, failing_height) {
-                info!(
-                    target: "marshal.emergency",
-                    %height_u,
-                    failing_height,
-                    fill_start,
-                    recovery_target = height_u,
-                    last_processed,
-                    "cold-start anchor: pending_gap set, scheduling forward fetch (no notify)",
-                );
-                self.schedule_recovery_fetch(resolver, fill_start, height_u)
-                    .await;
-                return RecoveryDeliverDecision::Deferred;
+            // Cold start: local prefix has not reached F - 1 yet.
+            if last_processed != failing_height.saturating_sub(1) {
+                return RecoveryDeliverDecision::StoreOnly;
             }
         }
 
-        let notify_result = if is_boundary && failing_height < height_u {
-            self.recovery_notifier
-                .notify_boundary_recovery_replay(extra, height_u)
-                .await
-        } else {
-            self.recovery_notifier
-                .notify_execution_recovery(extra, height_u)
-                .await
-        };
+        if !should_notify_recovery_execution(last_processed, height_u, failing_height) {
+            return RecoveryDeliverDecision::StoreOnly;
+        }
+
+        let notify_result = self
+            .recovery_notifier
+            .notify_execution_recovery(extra, height_u)
+            .await;
 
         if notify_result.is_ok() {
-            if let Some(id) = identity {
-                info!(
-                    target: "marshal.emergency",
-                    %height_u,
-                    failing_height = id.failing_height,
-                    recovery_nonce = id.nonce,
-                    is_boundary,
-                    "recovery notify ok; awaiting RecoverySwitchComplete",
-                );
-                self.recovery_gate.awaiting =
-                    Some(crate::marshal::recovery_sync::RecoveryAwaiting { identity: id });
-            }
+            self.recovery_gate.awaiting = Some(RecoveryAwaiting);
         } else {
             warn!(
                 target: "marshal.emergency",
@@ -1459,6 +1398,40 @@ where
         }
 
         RecoveryDeliverDecision::Deferred
+    }
+
+    /// After `last_processed` advances, run recovery notify for the next height if
+    /// that block was previously cached out-of-order in the archive.
+    async fn try_advance_recovery_at_next_height(&mut self) {
+        if self.recovery_gate.awaiting.is_some() {
+            return;
+        }
+        let next = self.last_processed_height.next();
+        let Some(block) = self.get_finalized_block(next).await else {
+            return;
+        };
+        let extra = block.extra_data();
+        if !self.emergency_qc_verifier.has_recovery_slots(extra) {
+            return;
+        }
+        let height_u = next.get();
+        if matches!(
+            self.evaluate_recovery_finalized(
+                extra,
+                next,
+                RecoveryDeliverKind::SequentialCatchUp,
+            )
+            .await,
+            RecoveryDeliverDecision::Store
+        ) {
+            info!(
+                target: "marshal.emergency",
+                %height_u,
+                last_processed = %self.last_processed_height,
+                "recovery completion at sequential catch-up; clearing pending_gap",
+            );
+            self.recovery_gate.pending_gap = None;
+        }
     }
 
     async fn schedule_recovery_fetch<Res>(
@@ -1491,13 +1464,13 @@ where
     {
         let failing_height = complete.identity.failing_height;
         let recovery_nonce = complete.identity.nonce;
-        self.recovery_gate.on_switch_complete(complete.identity);
+        self.recovery_gate.on_switch_complete();
         info!(
             target: "marshal.emergency",
             failing_height,
             recovery_nonce,
             pending_recovery_target = ?self.recovery_gate.pending_gap.as_ref().map(|g| g.recovery_target),
-            "RecoverySwitchComplete: cleared awaiting, updated last_applied",
+            "RecoverySwitchComplete: cleared awaiting, scheduling continuation fetch",
         );
         if let Some(gap) = self.recovery_gate.pending_gap.clone() {
             let from = self
@@ -1650,6 +1623,8 @@ where
             self.report_tip_after_processed(height, finalization, application)
                 .await;
         }
+
+        self.try_advance_recovery_at_next_height().await;
     }
 
     /// During recovery gap fill, tip must follow sequential dispatch rather than batch store order.
@@ -1952,14 +1927,10 @@ where
             let gap_start = gap_start.map(Height::next).unwrap_or(start);
 
             // Iterate backwards, repairing blocks as we go.
-            let cursor_extra = cursor.extra_data();
-            if self.epoch_length > 0
-                && is_epoch_boundary(gap_end.get(), self.epoch_length)
-                && self.emergency_qc_verifier.has_recovery_slots(cursor_extra)
-            {
+            if should_skip_backward_gap_repair(self.recovery_gate.pending_gap.is_some()) {
                 debug!(
                     height = %gap_end,
-                    "skipping backward gap repair for boundary recovery block",
+                    "skipping backward gap repair during recovery catch-up",
                 );
                 break 'cache_repair;
             }

@@ -21,6 +21,12 @@ pub trait EmergencyQcVerifier: Send + Sync {
         false
     }
 
+    /// Parse `failing_height` from slot 3 `recovery_consensus`.
+    fn parse_recovery_failing_height(&self, extra: &[u8]) -> Option<u64> {
+        self.parse_recovery_identity(extra)
+            .map(|identity| identity.failing_height)
+    }
+
     /// Parse recovery identity from `extra_data` for gate / replay matching.
     fn parse_recovery_identity(&self, extra: &[u8]) -> Option<RecoveryIdentity> {
         let _ = extra;

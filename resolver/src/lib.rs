@@ -12,17 +12,6 @@ commonware_macros::stability_scope!(BETA {
 
     pub mod p2p;
 
-    /// Result of delivering fetched data to a consumer.
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    pub enum DeliverOutcome {
-        /// Data is valid.
-        Accepted,
-        /// Data is invalid; the responder should be blocked.
-        Rejected,
-        /// Verification could not complete (e.g. missing local state); retry without blocking.
-        Deferred,
-    }
-
     /// Notified when data is available, and must validate it.
     pub trait Consumer: Clone + Send + 'static {
         /// Type used to uniquely identify data.
@@ -35,11 +24,13 @@ commonware_macros::stability_scope!(BETA {
         type Failure;
 
         /// Deliver data to the consumer.
+        ///
+        /// Returns `true` if the data is valid.
         fn deliver(
             &mut self,
             key: Self::Key,
             value: Self::Value,
-        ) -> impl Future<Output = DeliverOutcome> + Send;
+        ) -> impl Future<Output = bool> + Send;
 
         /// Let the consumer know that the data is not being fetched anymore.
         ///

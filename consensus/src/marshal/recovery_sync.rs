@@ -14,35 +14,26 @@ pub struct RecoveryIdentity {
     pub is_admin: bool,
 }
 
-/// Kind of recovery pending at an anchor boundary or execution height.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PendingRecoveryKind {
-    Execution,
-    BoundaryExecution,
-    BoundaryReplay,
-}
-
 /// Active forward-fill session while catching up through recovery epochs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingGap {
     pub recovery_target: u64,
     pub failing_height: u64,
-    pub kind: PendingRecoveryKind,
     pub fill_start: u64,
+    /// Set after [`RecoverySyncGate::on_switch_complete`]; allows storing the execution
+    /// block at `failing_height` that was deferred during the notify/switch handshake.
+    pub switch_completed: bool,
 }
 
 /// Switch in flight after `notify_*` until `RecoverySwitchComplete`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoveryAwaiting {
-    pub identity: RecoveryIdentity,
-}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryAwaiting;
 
 /// Marshal-side gate coordinating recovery deliver, notify, and forward fetch.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoverySyncGate {
     pub awaiting: Option<RecoveryAwaiting>,
     pub pending_gap: Option<PendingGap>,
-    pub last_applied_recovery: Option<RecoveryIdentity>,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -99,13 +90,68 @@ pub struct RecoverySwitchComplete {
     pub identity: RecoveryIdentity,
 }
 
-/// Whether a cold-start anchor should skip notify and only record `pending_gap`.
+/// Whether the anchor block's first deliver should notify before forward fill.
+///
+/// Requires the local processed prefix to end exactly at `F - 1` (hot restart /
+/// tail fill). Out-of-order network delivers are cached separately; notify runs
+/// when `height == last_processed + 1` via sequential catch-up.
 pub fn anchor_first_deliver_should_notify(last_processed: u64, failing_height: u64) -> bool {
-    last_processed >= failing_height.saturating_sub(1)
+    last_processed == failing_height.saturating_sub(1)
 }
 
-pub fn forward_fill_start(last_processed: u64, gap_start: u64, pending: &PendingGap) -> u64 {
-    if last_processed < pending.failing_height.saturating_sub(1) {
+/// Whether marshal should notify EL / recovery actor to run `emergency_enter`.
+///
+/// Only execution blocks (`height == failing_height`) when the local prefix has
+/// been processed through `failing_height - 1`. Boundary replay anchors
+/// (`failing_height < height`) never notify; they are cached until sequential
+/// catch-up reaches each execution height.
+pub fn should_notify_recovery_execution(
+    last_processed: u64,
+    height: u64,
+    failing_height: u64,
+) -> bool {
+    height == failing_height && last_processed.saturating_add(1) == failing_height
+}
+
+/// Whether marshal should store (not re-notify) the execution block at `F` after switch.
+///
+/// The first deliver at `F` triggers notify and returns `Deferred` without storing.
+/// Once `switch_completed` is set, the same block must be stored on re-deliver.
+pub fn should_store_execution_after_switch(
+    switch_completed: bool,
+    last_processed: u64,
+    height: u64,
+    failing_height: u64,
+) -> bool {
+    switch_completed
+        && height == failing_height
+        && last_processed.saturating_add(1) == failing_height
+}
+
+/// Whether a recovery deliver at `height` should only be cached (not notify yet)
+/// because blocks between `last_processed` and `height` have not been processed.
+///
+/// Requires an active `pending_gap` and `height > last_processed + 1`. First-anchor
+/// delivers (no `pending_gap` yet) use the cold-start / notify paths in
+/// [`super::core::actor::Actor::evaluate_recovery_finalized`].
+pub fn should_cache_recovery_out_of_order(
+    last_processed: u64,
+    height: u64,
+    has_pending_gap: bool,
+) -> bool {
+    has_pending_gap && height > last_processed.saturating_add(1)
+}
+
+/// Whether to skip backward `Block(parent)` repair during recovery catch-up.
+///
+/// While `pending_gap` is active the epoch is filling forward only via
+/// `missing_items` / `Finalized` fetch (execution blocks and boundary replay anchors).
+pub fn should_skip_backward_gap_repair(has_pending_gap: bool) -> bool {
+    has_pending_gap
+}
+
+pub fn forward_fill_start(last_processed: u64, gap_start: u64, failing_height: u64) -> u64 {
+    if last_processed < failing_height.saturating_sub(1) {
         gap_start.max(1)
     } else {
         last_processed.saturating_add(1)
@@ -116,50 +162,25 @@ pub fn is_epoch_boundary(height: u64, epoch_length: u64) -> bool {
     epoch_length > 0 && (height.saturating_add(1)) % epoch_length == 0
 }
 
-pub fn classify_pending_kind(
-    block_height: u64,
-    failing_height: u64,
-    epoch_length: u64,
-) -> PendingRecoveryKind {
-    let is_boundary = is_epoch_boundary(block_height, epoch_length);
-    if is_boundary && failing_height < block_height {
-        PendingRecoveryKind::BoundaryReplay
-    } else if is_boundary && failing_height == block_height {
-        PendingRecoveryKind::BoundaryExecution
-    } else {
-        PendingRecoveryKind::Execution
-    }
-}
-
 pub fn is_recovery_completion_deliver(
     height: u64,
     last_processed: u64,
-    pending: &Option<PendingGap>,
-    awaiting: bool,
-    block_identity: Option<RecoveryIdentity>,
-    last_applied: &Option<RecoveryIdentity>,
+    gap: &PendingGap,
 ) -> bool {
-    let Some(gap) = pending else {
-        return false;
-    };
-    if awaiting || gap.recovery_target != height || last_processed.saturating_add(1) != height {
-        return false;
-    }
-    let Some(id) = block_identity else {
-        return true;
-    };
-    last_applied.as_ref() == Some(&id)
+    gap.recovery_target == height && last_processed.saturating_add(1) == height
 }
 
 impl RecoverySyncGate {
-    pub fn on_switch_complete(&mut self, identity: RecoveryIdentity) {
+    pub fn on_switch_complete(&mut self) {
         self.awaiting = None;
-        self.last_applied_recovery = Some(identity);
+        if let Some(gap) = &mut self.pending_gap {
+            gap.switch_completed = true;
+        }
     }
 
     pub fn continuation_fetch_start(&self, last_processed: u64) -> u64 {
         if let Some(gap) = &self.pending_gap {
-            forward_fill_start(last_processed, gap.fill_start, gap)
+            forward_fill_start(last_processed, gap.fill_start, gap.failing_height)
         } else {
             last_processed.saturating_add(1)
         }
@@ -190,8 +211,8 @@ impl RecoverySyncGate {
 ///
 /// - `awaiting`: defer all tip advances (switch in flight).
 /// - `pending_gap`: defer tip at or above `recovery_target` (anchor) until completion.
-/// - `pending_gap`: defer tip more than one height ahead of `last_processed` so EL FCU
-///   stays aligned with sequential `Update::Block` dispatch during forward fill.
+/// - defer tip more than one height ahead of `last_processed` so EL FCU stays aligned
+///   with sequential `Update::Block` dispatch (recovery forward fill and cold catch-up).
 pub fn should_defer_tip_fcu(
     awaiting: bool,
     pending_recovery_target: Option<u64>,
@@ -201,10 +222,7 @@ pub fn should_defer_tip_fcu(
     if awaiting {
         return true;
     }
-    let Some(target) = pending_recovery_target else {
-        return false;
-    };
-    if height >= target {
+    if pending_recovery_target.is_some_and(|target| height >= target) {
         return true;
     }
     height > last_processed.saturating_add(1)
@@ -232,6 +250,11 @@ impl RecoverySyncGateStatus {
     pub fn active(&self) -> bool {
         self.awaiting || self.pending_recovery_target.is_some()
     }
+
+    /// Whether marshal is still catching up sequentially (live tip ahead of processed prefix).
+    pub fn has_sequential_gap(&self, height: u64) -> bool {
+        height > self.last_processed_height.saturating_add(1)
+    }
 }
 
 /// Boxed future helper for async notifier implementations (used by orqus-reth).
@@ -241,19 +264,30 @@ pub type BoxedNotifyFut<'a> =
 
 #[cfg(test)]
 mod tests {
-    use super::should_defer_tip_fcu;
+    use super::*;
 
     #[test]
-    fn defer_anchor_and_out_of_order_tips_during_gap() {
-        assert!(should_defer_tip_fcu(false, Some(199), 159, 199));
-        assert!(should_defer_tip_fcu(false, Some(199), 159, 166));
-        assert!(!should_defer_tip_fcu(false, Some(199), 159, 160));
-        assert!(!should_defer_tip_fcu(false, Some(199), 160, 161));
+    fn notify_before_switch_store_after_switch() {
+        let last = 269u64;
+        let f = 270u64;
+        assert!(should_notify_recovery_execution(last, f, f));
+        assert!(!should_store_execution_after_switch(false, last, f, f));
+        assert!(should_store_execution_after_switch(true, last, f, f));
     }
 
     #[test]
-    fn defer_all_tips_while_awaiting() {
-        assert!(should_defer_tip_fcu(true, Some(199), 159, 160));
-        assert!(should_defer_tip_fcu(true, None, 159, 160));
+    fn on_switch_complete_sets_flag_on_pending_gap() {
+        let mut gate = RecoverySyncGate {
+            awaiting: Some(RecoveryAwaiting),
+            pending_gap: Some(PendingGap {
+                recovery_target: 279,
+                failing_height: 270,
+                fill_start: 270,
+                switch_completed: false,
+            }),
+        };
+        gate.on_switch_complete();
+        assert!(gate.awaiting.is_none());
+        assert!(gate.pending_gap.as_ref().unwrap().switch_completed);
     }
 }

@@ -1,7 +1,6 @@
 use crate::{simplex::types::Certificate, types::View};
 use bytes::Bytes;
 use commonware_cryptography::{certificate::Scheme, Digest};
-use commonware_resolver::DeliverOutcome;
 use commonware_resolver::{p2p::Producer, Consumer};
 use commonware_utils::{
     channel::{fallible::AsyncFallibleExt, mpsc, oneshot},
@@ -71,9 +70,8 @@ impl Consumer for Handler {
     type Value = Bytes;
     type Failure = ();
 
-    async fn deliver(&mut self, key: Self::Key, value: Self::Value) -> DeliverOutcome {
-        let accepted = self
-            .sender
+    async fn deliver(&mut self, key: Self::Key, value: Self::Value) -> bool {
+        self.sender
             .request_or(
                 |response| HandlerMessage::Deliver {
                     view: View::new(key.into()),
@@ -82,12 +80,7 @@ impl Consumer for Handler {
                 },
                 false,
             )
-            .await;
-        if accepted {
-            DeliverOutcome::Accepted
-        } else {
-            DeliverOutcome::Rejected
-        }
+            .await
     }
 
     async fn failed(&mut self, _: Self::Key, _: Self::Failure) {

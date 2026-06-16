@@ -77,9 +77,11 @@ mod recovery_sync;
 pub use config::Config;
 pub use emergency::EmergencyQcVerifier;
 pub use recovery_sync::{
-    anchor_first_deliver_should_notify, classify_pending_kind, forward_fill_start,
-    is_epoch_boundary, is_recovery_completion_deliver, should_defer_tip_fcu, BoxedNotifyFut,
-    PendingGap, PendingRecoveryKind, RecoveryIdentity, RecoveryNotifyError,
+    anchor_first_deliver_should_notify, forward_fill_start,
+    is_epoch_boundary, is_recovery_completion_deliver, should_cache_recovery_out_of_order,
+    should_notify_recovery_execution, should_skip_backward_gap_repair,
+    should_store_execution_after_switch, should_defer_tip_fcu, BoxedNotifyFut,
+    PendingGap, RecoveryAwaiting, RecoveryIdentity, RecoveryNotifyError,
     RecoverySwitchComplete, RecoverySwitchNotifier, RecoverySyncGate, RecoverySyncGateStatus,
 };
 

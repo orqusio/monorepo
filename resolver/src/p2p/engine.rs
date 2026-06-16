@@ -4,7 +4,7 @@ use super::{
     ingress::{FetchRequest, Mailbox, Message},
     metrics, wire, Producer,
 };
-use crate::{Consumer, DeliverOutcome};
+use crate::Consumer;
 use bytes::Bytes;
 use commonware_cryptography::PublicKey;
 use commonware_macros::select_loop;
@@ -423,24 +423,17 @@ impl<
             return;
         };
 
-        match self.consumer.deliver(key.clone(), response).await {
-            DeliverOutcome::Accepted => {
-                self.metrics.fetch.inc(Status::Success);
-                self.fetch_timers.remove(&key).unwrap(); // must exist in the map, records metric on drop
-                self.fetcher.clear_targets(&key);
-            }
-            DeliverOutcome::Rejected => {
-                commonware_p2p::block!(self.blocker, peer.clone(), "invalid data received");
-                self.fetcher.block(peer);
-                self.metrics.fetch.inc(Status::Failure);
-                self.fetcher.add_retry(key);
-            }
-            DeliverOutcome::Deferred => {
-                trace!(?peer, ?id, "verification deferred; retrying without blocking peer");
-                self.metrics.fetch.inc(Status::Failure);
-                self.fetcher.add_retry(key);
-            }
+        if self.consumer.deliver(key.clone(), response).await {
+            self.metrics.fetch.inc(Status::Success);
+            self.fetch_timers.remove(&key).unwrap(); // must exist in the map, records metric on drop
+            self.fetcher.clear_targets(&key);
+            return;
         }
+
+        commonware_p2p::block!(self.blocker, peer.clone(), "invalid data received");
+        self.fetcher.block(peer);
+        self.metrics.fetch.inc(Status::Failure);
+        self.fetcher.add_retry(key);
     }
 
     /// Handle a network response from a peer that did not have the data.
