@@ -73,6 +73,9 @@ pub struct Config<
     /// Epoch for the consensus engine. Each running engine should have a unique epoch.
     pub epoch: Epoch,
 
+    /// Consensus zone for the running engine.
+    pub zone_id: u64,
+
     /// Number of bytes to buffer when replaying during startup.
     pub replay_buffer: NonZeroUsize,
 

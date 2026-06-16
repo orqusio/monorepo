@@ -310,6 +310,26 @@ pub enum Vote<S: Scheme, D: Digest> {
     Finalize(Finalize<S, D>),
 }
 
+impl<S: Scheme, D: Digest> Vote<S, D> {
+    /// Returns the consensus zone that produced this vote.
+    pub const fn zone_id(&self) -> u64 {
+        match self {
+            Self::Notarize(v) => v.zone_id,
+            Self::Nullify(v) => v.zone_id,
+            Self::Finalize(v) => v.zone_id,
+        }
+    }
+
+    /// Sets the consensus zone that produced this vote.
+    pub const fn set_zone_id(&mut self, zone_id: u64) {
+        match self {
+            Self::Notarize(v) => v.zone_id = zone_id,
+            Self::Nullify(v) => v.zone_id = zone_id,
+            Self::Finalize(v) => v.zone_id = zone_id,
+        }
+    }
+}
+
 impl<S: Scheme, D: Digest> Write for Vote<S, D> {
     fn write(&self, writer: &mut impl BufMut) {
         match self {
@@ -417,6 +437,26 @@ pub enum Certificate<S: Scheme, D: Digest> {
     Nullification(Nullification<S>),
     /// A recovered certificate for a finalization.
     Finalization(Finalization<S, D>),
+}
+
+impl<S: Scheme, D: Digest> Certificate<S, D> {
+    /// Returns the consensus zone that produced this certificate.
+    pub const fn zone_id(&self) -> u64 {
+        match self {
+            Self::Notarization(v) => v.zone_id,
+            Self::Nullification(v) => v.zone_id,
+            Self::Finalization(v) => v.zone_id,
+        }
+    }
+
+    /// Sets the consensus zone that produced this certificate.
+    pub const fn set_zone_id(&mut self, zone_id: u64) {
+        match self {
+            Self::Notarization(v) => v.zone_id = zone_id,
+            Self::Nullification(v) => v.zone_id = zone_id,
+            Self::Finalization(v) => v.zone_id = zone_id,
+        }
+    }
 }
 
 impl<S: Scheme, D: Digest> Write for Certificate<S, D> {
@@ -808,6 +848,8 @@ where
 /// Validator vote that endorses a proposal for notarization.
 #[derive(Clone, Debug)]
 pub struct Notarize<S: Scheme, D: Digest> {
+    /// Consensus zone that produced this vote.
+    pub zone_id: u64,
     /// Proposal being notarized.
     pub proposal: Proposal<D>,
     /// Scheme-specific attestation material.
@@ -825,6 +867,7 @@ impl<S: Scheme, D: Digest> Notarize<S, D> {
         })?;
 
         Some(Self {
+            zone_id: 0,
             proposal,
             attestation,
         })
@@ -856,7 +899,9 @@ impl<S: Scheme, D: Digest> Notarize<S, D> {
 
 impl<S: Scheme, D: Digest> PartialEq for Notarize<S, D> {
     fn eq(&self, other: &Self) -> bool {
-        self.proposal == other.proposal && self.attestation == other.attestation
+        self.zone_id == other.zone_id
+            && self.proposal == other.proposal
+            && self.attestation == other.attestation
     }
 }
 
@@ -864,6 +909,7 @@ impl<S: Scheme, D: Digest> Eq for Notarize<S, D> {}
 
 impl<S: Scheme, D: Digest> Hash for Notarize<S, D> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.zone_id.hash(state);
         self.proposal.hash(state);
         self.attestation.hash(state);
     }
@@ -873,12 +919,13 @@ impl<S: Scheme, D: Digest> Write for Notarize<S, D> {
     fn write(&self, writer: &mut impl BufMut) {
         self.proposal.write(writer);
         self.attestation.write(writer);
+        self.zone_id.write(writer);
     }
 }
 
 impl<S: Scheme, D: Digest> EncodeSize for Notarize<S, D> {
     fn encode_size(&self) -> usize {
-        self.proposal.encode_size() + self.attestation.encode_size()
+        self.proposal.encode_size() + self.attestation.encode_size() + self.zone_id.encode_size()
     }
 }
 
@@ -888,8 +935,14 @@ impl<S: Scheme, D: Digest> Read for Notarize<S, D> {
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, Error> {
         let proposal = Proposal::read(reader)?;
         let attestation = Attestation::read(reader)?;
+        let zone_id = if reader.has_remaining() {
+            u64::read(reader)?
+        } else {
+            0
+        };
 
         Ok(Self {
+            zone_id,
             proposal,
             attestation,
         })
@@ -926,6 +979,7 @@ where
         Ok(Self {
             proposal,
             attestation,
+            zone_id:0,
         })
     }
 }
@@ -956,6 +1010,8 @@ where
 /// via [`super::scheme::bls12381_threshold::vrf::Seedable::seed`].
 #[derive(Clone, Debug)]
 pub struct Notarization<S: Scheme, D: Digest> {
+    /// Consensus zone that produced this certificate.
+    pub zone_id: u64,
     /// The proposal that has been notarized.
     pub proposal: Proposal<D>,
     /// The recovered certificate for the proposal.
@@ -975,6 +1031,7 @@ impl<S: Scheme, D: Digest> Notarization<S, D> {
             scheme.assemble::<_, N3f1>(iter.map(|n| n.attestation.clone()), strategy)?;
 
         Some(Self {
+            zone_id: 0,
             proposal,
             certificate,
         })
@@ -1010,7 +1067,9 @@ impl<S: Scheme, D: Digest> Notarization<S, D> {
 
 impl<S: Scheme, D: Digest> PartialEq for Notarization<S, D> {
     fn eq(&self, other: &Self) -> bool {
-        self.proposal == other.proposal && self.certificate == other.certificate
+        self.zone_id == other.zone_id
+            && self.proposal == other.proposal
+            && self.certificate == other.certificate
     }
 }
 
@@ -1018,6 +1077,7 @@ impl<S: Scheme, D: Digest> Eq for Notarization<S, D> {}
 
 impl<S: Scheme, D: Digest> Hash for Notarization<S, D> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.zone_id.hash(state);
         self.proposal.hash(state);
         self.certificate.hash(state);
     }
@@ -1027,12 +1087,13 @@ impl<S: Scheme, D: Digest> Write for Notarization<S, D> {
     fn write(&self, writer: &mut impl BufMut) {
         self.proposal.write(writer);
         self.certificate.write(writer);
+        self.zone_id.write(writer);
     }
 }
 
 impl<S: Scheme, D: Digest> EncodeSize for Notarization<S, D> {
     fn encode_size(&self) -> usize {
-        self.proposal.encode_size() + self.certificate.encode_size()
+        self.zone_id.encode_size() + self.proposal.encode_size() + self.certificate.encode_size()
     }
 }
 
@@ -1042,8 +1103,14 @@ impl<S: Scheme, D: Digest> Read for Notarization<S, D> {
     fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let proposal = Proposal::read(reader)?;
         let certificate = S::Certificate::read_cfg(reader, cfg)?;
+        let zone_id = if reader.has_remaining() {
+            u64::read(reader)?
+        } else {
+            0
+        };
 
         Ok(Self {
+            zone_id,
             proposal,
             certificate,
         })
@@ -1072,6 +1139,7 @@ where
         let proposal = Proposal::arbitrary(u)?;
         let certificate = S::Certificate::arbitrary(u)?;
         Ok(Self {
+            zone_id: 0,
             proposal,
             certificate,
         })
@@ -1082,6 +1150,8 @@ where
 /// This is typically used when the leader is unresponsive or fails to propose a valid block.
 #[derive(Clone, Debug)]
 pub struct Nullify<S: Scheme> {
+    /// Consensus zone that produced this vote.
+    pub zone_id: u64,
     /// The round to be nullified (skipped).
     pub round: Round,
     /// Scheme-specific attestation material.
@@ -1090,7 +1160,9 @@ pub struct Nullify<S: Scheme> {
 
 impl<S: Scheme> PartialEq for Nullify<S> {
     fn eq(&self, other: &Self) -> bool {
-        self.round == other.round && self.attestation == other.attestation
+        self.zone_id == other.zone_id
+            && self.round == other.round
+            && self.attestation == other.attestation
     }
 }
 
@@ -1098,6 +1170,7 @@ impl<S: Scheme> Eq for Nullify<S> {}
 
 impl<S: Scheme> Hash for Nullify<S> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.zone_id.hash(state);
         self.round.hash(state);
         self.attestation.hash(state);
     }
@@ -1111,7 +1184,11 @@ impl<S: Scheme> Nullify<S> {
     {
         let attestation = scheme.sign::<D>(Subject::Nullify { round })?;
 
-        Some(Self { round, attestation })
+        Some(Self {
+            zone_id: 0,
+            round,
+            attestation,
+        })
     }
 
     /// Verifies the nullify vote against the provided signing scheme.
@@ -1140,12 +1217,13 @@ impl<S: Scheme> Write for Nullify<S> {
     fn write(&self, writer: &mut impl BufMut) {
         self.round.write(writer);
         self.attestation.write(writer);
+        self.zone_id.write(writer);
     }
 }
 
 impl<S: Scheme> EncodeSize for Nullify<S> {
     fn encode_size(&self) -> usize {
-        self.round.encode_size() + self.attestation.encode_size()
+        self.round.encode_size() + self.attestation.encode_size() + self.zone_id.encode_size()
     }
 }
 
@@ -1155,8 +1233,17 @@ impl<S: Scheme> Read for Nullify<S> {
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, Error> {
         let round = Round::read(reader)?;
         let attestation = Attestation::read(reader)?;
+        let zone_id = if reader.has_remaining() {
+            u64::read(reader)?
+        } else {
+            0
+        };
 
-        Ok(Self { round, attestation })
+        Ok(Self {
+            zone_id,
+            round,
+            attestation,
+        })
     }
 }
 
@@ -1186,7 +1273,11 @@ where
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         let round = Round::arbitrary(u)?;
         let attestation = Attestation::arbitrary(u)?;
-        Ok(Self { round, attestation })
+        Ok(Self {
+            zone_id: 0,
+            round,
+            attestation,
+        })
     }
 }
 
@@ -1194,6 +1285,8 @@ where
 /// When a view is nullified, the consensus moves to the next view without finalizing a block.
 #[derive(Clone, Debug)]
 pub struct Nullification<S: Scheme> {
+    /// Consensus zone that produced this certificate.
+    pub zone_id: u64,
     /// The round in which this nullification is made.
     pub round: Round,
     /// The recovered certificate for the nullification.
@@ -1212,7 +1305,11 @@ impl<S: Scheme> Nullification<S> {
         let certificate =
             scheme.assemble::<_, N3f1>(iter.map(|n| n.attestation.clone()), strategy)?;
 
-        Some(Self { round, certificate })
+        Some(Self {
+            zone_id: 0,
+            round,
+            certificate,
+        })
     }
 
     /// Verifies the nullification certificate against the provided signing scheme.
@@ -1243,7 +1340,9 @@ impl<S: Scheme> Nullification<S> {
 
 impl<S: Scheme> PartialEq for Nullification<S> {
     fn eq(&self, other: &Self) -> bool {
-        self.round == other.round && self.certificate == other.certificate
+        self.zone_id == other.zone_id
+            && self.round == other.round
+            && self.certificate == other.certificate
     }
 }
 
@@ -1251,6 +1350,7 @@ impl<S: Scheme> Eq for Nullification<S> {}
 
 impl<S: Scheme> Hash for Nullification<S> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.zone_id.hash(state);
         self.round.hash(state);
         self.certificate.hash(state);
     }
@@ -1260,12 +1360,13 @@ impl<S: Scheme> Write for Nullification<S> {
     fn write(&self, writer: &mut impl BufMut) {
         self.round.write(writer);
         self.certificate.write(writer);
+        self.zone_id.write(writer);
     }
 }
 
 impl<S: Scheme> EncodeSize for Nullification<S> {
     fn encode_size(&self) -> usize {
-        self.round.encode_size() + self.certificate.encode_size()
+        self.zone_id.encode_size() + self.round.encode_size() + self.certificate.encode_size()
     }
 }
 
@@ -1275,8 +1376,17 @@ impl<S: Scheme> Read for Nullification<S> {
     fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let round = Round::read(reader)?;
         let certificate = S::Certificate::read_cfg(reader, cfg)?;
+        let zone_id = if reader.has_remaining() {
+            u64::read(reader)?
+        } else {
+            0
+        };
 
-        Ok(Self { round, certificate })
+        Ok(Self {
+            zone_id,
+            round,
+            certificate,
+        })
     }
 }
 
@@ -1300,7 +1410,11 @@ where
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         let round = Round::arbitrary(u)?;
         let certificate = S::Certificate::arbitrary(u)?;
-        Ok(Self { round, certificate })
+        Ok(Self {
+            zone_id: 0,
+            round,
+            certificate,
+        })
     }
 }
 
@@ -1309,6 +1423,8 @@ where
 /// for this round.
 #[derive(Clone, Debug)]
 pub struct Finalize<S: Scheme, D: Digest> {
+    /// Consensus zone that produced this vote.
+    pub zone_id: u64,
     /// Proposal being finalized.
     pub proposal: Proposal<D>,
     /// Scheme-specific attestation material.
@@ -1326,6 +1442,7 @@ impl<S: Scheme, D: Digest> Finalize<S, D> {
         })?;
 
         Some(Self {
+            zone_id: 0,
             proposal,
             attestation,
         })
@@ -1357,7 +1474,9 @@ impl<S: Scheme, D: Digest> Finalize<S, D> {
 
 impl<S: Scheme, D: Digest> PartialEq for Finalize<S, D> {
     fn eq(&self, other: &Self) -> bool {
-        self.proposal == other.proposal && self.attestation == other.attestation
+        self.zone_id == other.zone_id
+            && self.proposal == other.proposal
+            && self.attestation == other.attestation
     }
 }
 
@@ -1365,6 +1484,7 @@ impl<S: Scheme, D: Digest> Eq for Finalize<S, D> {}
 
 impl<S: Scheme, D: Digest> Hash for Finalize<S, D> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.zone_id.hash(state);
         self.proposal.hash(state);
         self.attestation.hash(state);
     }
@@ -1374,12 +1494,13 @@ impl<S: Scheme, D: Digest> Write for Finalize<S, D> {
     fn write(&self, writer: &mut impl BufMut) {
         self.proposal.write(writer);
         self.attestation.write(writer);
+        self.zone_id.write(writer);
     }
 }
 
 impl<S: Scheme, D: Digest> EncodeSize for Finalize<S, D> {
     fn encode_size(&self) -> usize {
-        self.proposal.encode_size() + self.attestation.encode_size()
+        self.proposal.encode_size() + self.attestation.encode_size() + self.zone_id.encode_size()
     }
 }
 
@@ -1389,8 +1510,14 @@ impl<S: Scheme, D: Digest> Read for Finalize<S, D> {
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, Error> {
         let proposal = Proposal::read(reader)?;
         let attestation = Attestation::read(reader)?;
+        let zone_id = if reader.has_remaining() {
+            u64::read(reader)?
+        } else {
+            0
+        };
 
         Ok(Self {
+            zone_id,
             proposal,
             attestation,
         })
@@ -1425,6 +1552,7 @@ where
         let proposal = Proposal::arbitrary(u)?;
         let attestation = Attestation::arbitrary(u)?;
         Ok(Self {
+            zone_id: 0,
             proposal,
             attestation,
         })
@@ -1439,6 +1567,8 @@ where
 /// via [`super::scheme::bls12381_threshold::vrf::Seedable::seed`].
 #[derive(Clone, Debug)]
 pub struct Finalization<S: Scheme, D: Digest> {
+    /// Consensus zone that produced this certificate.
+    pub zone_id: u64,
     /// The proposal that has been finalized.
     pub proposal: Proposal<D>,
     /// The recovered certificate for the proposal.
@@ -1458,6 +1588,7 @@ impl<S: Scheme, D: Digest> Finalization<S, D> {
             scheme.assemble::<_, N3f1>(iter.map(|f| f.attestation.clone()), strategy)?;
 
         Some(Self {
+            zone_id: 0,
             proposal,
             certificate,
         })
@@ -1493,7 +1624,9 @@ impl<S: Scheme, D: Digest> Finalization<S, D> {
 
 impl<S: Scheme, D: Digest> PartialEq for Finalization<S, D> {
     fn eq(&self, other: &Self) -> bool {
-        self.proposal == other.proposal && self.certificate == other.certificate
+        self.zone_id == other.zone_id
+            && self.proposal == other.proposal
+            && self.certificate == other.certificate
     }
 }
 
@@ -1501,6 +1634,7 @@ impl<S: Scheme, D: Digest> Eq for Finalization<S, D> {}
 
 impl<S: Scheme, D: Digest> Hash for Finalization<S, D> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.zone_id.hash(state);
         self.proposal.hash(state);
         self.certificate.hash(state);
     }
@@ -1510,12 +1644,13 @@ impl<S: Scheme, D: Digest> Write for Finalization<S, D> {
     fn write(&self, writer: &mut impl BufMut) {
         self.proposal.write(writer);
         self.certificate.write(writer);
+        self.zone_id.write(writer);
     }
 }
 
 impl<S: Scheme, D: Digest> EncodeSize for Finalization<S, D> {
     fn encode_size(&self) -> usize {
-        self.proposal.encode_size() + self.certificate.encode_size()
+        self.zone_id.encode_size() + self.proposal.encode_size() + self.certificate.encode_size()
     }
 }
 
@@ -1525,8 +1660,14 @@ impl<S: Scheme, D: Digest> Read for Finalization<S, D> {
     fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let proposal = Proposal::read(reader)?;
         let certificate = S::Certificate::read_cfg(reader, cfg)?;
+        let zone_id = if reader.has_remaining() {
+            u64::read(reader)?
+        } else {
+            0
+        };
 
         Ok(Self {
+            zone_id,
             proposal,
             certificate,
         })
@@ -1555,6 +1696,7 @@ where
         let proposal = Proposal::arbitrary(u)?;
         let certificate = S::Certificate::arbitrary(u)?;
         Ok(Self {
+            zone_id: 0,
             proposal,
             certificate,
         })

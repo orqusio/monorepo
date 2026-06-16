@@ -205,6 +205,7 @@ mod tests {
             })
             .expect("signing failed");
         let notarize = Notarize {
+            zone_id: 0,
             proposal,
             attestation,
         };
@@ -250,6 +251,7 @@ mod tests {
             })
             .expect("signing failed");
         let notarize = Notarize {
+            zone_id: 0,
             proposal,
             attestation,
         };
@@ -297,6 +299,7 @@ mod tests {
             .expect("failed to assemble certificate");
 
         let notarization = Notarization {
+            zone_id: 0,
             proposal,
             certificate,
         };
@@ -335,6 +338,7 @@ mod tests {
             .expect("signing failed");
 
         let notarize = Notarize {
+            zone_id: 0,
             proposal,
             attestation,
         };
@@ -371,6 +375,7 @@ mod tests {
             .expect("signing failed");
 
         let notarize = Notarize {
+            zone_id: 0,
             proposal,
             attestation,
         };

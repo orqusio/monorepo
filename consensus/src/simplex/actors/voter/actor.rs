@@ -105,6 +105,7 @@ pub struct Actor<
     automaton: A,
     relay: R,
     reporter: F,
+    zone_id: u64,
 
     certificate_config: <S::Certificate as Read>::Cfg,
     partition: String,
@@ -131,7 +132,16 @@ impl<
         F: Reporter<Activity = Activity<S, D>>,
     > Actor<E, S, L, B, D, A, R, F>
 {
+    #[allow(dead_code)]
     pub fn new(context: E, cfg: Config<S, L, B, D, A, R, F>) -> (Self, Mailbox<S, D>) {
+        Self::new_with_zone_id(context, cfg, 0)
+    }
+
+    pub fn new_with_zone_id(
+        context: E,
+        cfg: Config<S, L, B, D, A, R, F>,
+        zone_id: u64,
+    ) -> (Self, Mailbox<S, D>) {
         // Assert correctness of timeouts
         if cfg.leader_timeout > cfg.certification_timeout {
             panic!("leader timeout must be less than or equal to certification timeout");
@@ -181,6 +191,7 @@ impl<
                 automaton: cfg.automaton,
                 relay: cfg.relay,
                 reporter: cfg.reporter,
+                zone_id,
 
                 certificate_config,
                 partition: cfg.partition,
@@ -254,8 +265,10 @@ impl<
     async fn broadcast_vote<T: Sender>(
         &mut self,
         sender: &mut WrappedSender<T, Vote<S, D>>,
-        vote: Vote<S, D>,
+        mut vote: Vote<S, D>,
     ) {
+        vote.set_zone_id(self.zone_id);
+
         // Update outbound metrics
         let metric = match &vote {
             Vote::Notarize(_) => metrics::Outbound::notarize(),
@@ -272,8 +285,10 @@ impl<
     async fn broadcast_certificate<T: Sender>(
         &mut self,
         sender: &mut WrappedSender<T, Certificate<S, D>>,
-        certificate: Certificate<S, D>,
+        mut certificate: Certificate<S, D>,
     ) {
+        certificate.set_zone_id(self.zone_id);
+
         // Update outbound metrics
         let metric = match &certificate {
             Certificate::Notarization(_) => metrics::Outbound::notarization(),

@@ -61,6 +61,7 @@ pub struct Actor<
     activity_timeout: ViewDelta,
     skip_timeout: ViewDelta,
     epoch: Epoch,
+    zone_id: u64,
 
     mailbox_receiver: mpsc::Receiver<Message<S, D>>,
 
@@ -82,7 +83,16 @@ impl<
         T: Strategy,
     > Actor<E, S, B, D, R, T>
 {
+    #[allow(dead_code)]
     pub fn new(context: E, cfg: Config<S, B, R, T>) -> (Self, Mailbox<S, D>) {
+        Self::new_with_zone_id(context, cfg, 0)
+    }
+
+    pub fn new_with_zone_id(
+        context: E,
+        cfg: Config<S, B, R, T>,
+        zone_id: u64,
+    ) -> (Self, Mailbox<S, D>) {
         let added = Counter::default();
         let verified = Counter::default();
         let inbound_messages = Family::<Inbound, Counter>::default();
@@ -142,6 +152,7 @@ impl<
                 activity_timeout: cfg.activity_timeout,
                 skip_timeout: cfg.skip_timeout,
                 epoch: cfg.epoch,
+                zone_id,
 
                 mailbox_receiver: receiver,
 
@@ -315,6 +326,16 @@ impl<
                     continue;
                 }
 
+                // Skip certificates produced by another consensus zone.
+                if message.zone_id() != self.zone_id {
+                    trace!(
+                        local_zone_id = self.zone_id,
+                        message_zone_id = message.zone_id(),
+                        "skipping certificate from different zone"
+                    );
+                    continue;
+                }
+
                 // Allow future certificates (they advance our view)
                 let view = message.view();
                 if !interesting(
@@ -419,6 +440,16 @@ impl<
                 // If the epoch is not the current epoch, block
                 if message.epoch() != self.epoch {
                     commonware_p2p::block!(self.blocker, sender, "epoch mismatch");
+                    continue;
+                }
+
+                // Skip votes produced by another consensus zone.
+                if message.zone_id() != self.zone_id {
+                    trace!(
+                        local_zone_id = self.zone_id,
+                        message_zone_id = message.zone_id(),
+                        "skipping vote from different zone"
+                    );
                     continue;
                 }
 

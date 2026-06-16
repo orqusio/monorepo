@@ -57,7 +57,7 @@ impl<
         cfg.assert();
 
         // Create batcher
-        let (batcher, batcher_mailbox) = batcher::Actor::new(
+        let (batcher, batcher_mailbox) = batcher::Actor::new_with_zone_id(
             context.with_label("batcher"),
             batcher::Config {
                 scheme: cfg.scheme.clone(),
@@ -69,10 +69,11 @@ impl<
                 activity_timeout: cfg.activity_timeout,
                 skip_timeout: cfg.skip_timeout,
             },
+            cfg.zone_id,
         );
 
         // Create voter
-        let (voter, voter_mailbox) = voter::Actor::new(
+        let (voter, voter_mailbox) = voter::Actor::new_with_zone_id(
             context.with_label("voter"),
             voter::Config {
                 scheme: cfg.scheme.clone(),
@@ -92,6 +93,7 @@ impl<
                 write_buffer: cfg.write_buffer,
                 page_cache: cfg.page_cache,
             },
+            cfg.zone_id,
         );
 
         // Create resolver

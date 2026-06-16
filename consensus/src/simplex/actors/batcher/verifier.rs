@@ -210,10 +210,14 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
             return (vec![], vec![]);
         }
 
-        let (proposals, attestations): (Vec<_>, Vec<_>) = notarizes
+        let (zone_ids, proposals, attestations): (Vec<_>, Vec<_>, Vec<_>) = notarizes
             .into_iter()
-            .map(|n| (n.proposal, n.attestation))
-            .unzip();
+            .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, n| {
+                acc.0.push(n.zone_id);
+                acc.1.push(n.proposal);
+                acc.2.push(n.attestation);
+                acc
+            });
 
         let proposal = &proposals[0];
 
@@ -229,9 +233,11 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         (
             verified
                 .into_iter()
+                .zip(zone_ids)
                 .zip(proposals)
-                .map(|(attestation, proposal)| {
+                .map(|((attestation, zone_id), proposal)| {
                     Vote::Notarize(Notarize {
+                        zone_id,
                         proposal,
                         attestation,
                     })
@@ -305,6 +311,10 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         }
 
         let round = nullifies[0].round;
+        let zone_ids = nullifies
+            .iter()
+            .map(|nullify| nullify.zone_id)
+            .collect::<Vec<_>>();
 
         let Verification { verified, invalid } = self.scheme.verify_attestations::<_, D, _>(
             rng,
@@ -318,7 +328,14 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         (
             verified
                 .into_iter()
-                .map(|attestation| Vote::Nullify(Nullify { round, attestation }))
+                .zip(zone_ids)
+                .map(|(attestation, zone_id)| {
+                    Vote::Nullify(Nullify {
+                        zone_id,
+                        round,
+                        attestation,
+                    })
+                })
                 .collect(),
             invalid,
         )
@@ -380,10 +397,14 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
             return (vec![], vec![]);
         }
 
-        let (proposals, attestations): (Vec<_>, Vec<_>) = finalizes
+        let (zone_ids, proposals, attestations): (Vec<_>, Vec<_>, Vec<_>) = finalizes
             .into_iter()
-            .map(|n| (n.proposal, n.attestation))
-            .unzip();
+            .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, n| {
+                acc.0.push(n.zone_id);
+                acc.1.push(n.proposal);
+                acc.2.push(n.attestation);
+                acc
+            });
 
         let proposal = &proposals[0];
 
@@ -399,9 +420,11 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         (
             verified
                 .into_iter()
+                .zip(zone_ids)
                 .zip(proposals)
-                .map(|(attestation, proposal)| {
+                .map(|((attestation, zone_id), proposal)| {
                     Vote::Finalize(Finalize {
+                        zone_id,
                         proposal,
                         attestation,
                     })
