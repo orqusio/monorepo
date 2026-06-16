@@ -1,4 +1,4 @@
-use crate::Span;
+use crate::{DeliverOutcome, Span};
 use commonware_utils::channel::{fallible::FallibleExt, mpsc};
 use std::collections::HashMap;
 
@@ -67,12 +67,14 @@ impl<K: Span, V: Clone + PartialEq + Send + 'static> crate::Consumer for Consume
     /// Deliver data to the consumer.
     ///
     /// Returns `true` if the value is expected for the key or if there is no expected value.
-    async fn deliver(&mut self, key: Self::Key, value: Self::Value) -> bool {
+    async fn deliver(&mut self, key: Self::Key, value: Self::Value) -> DeliverOutcome {
         let valid = self.expected.get(&key).is_none_or(|v| v == &value);
         if valid {
             self.sender.send_lossy(Event::Success(key, value));
+            DeliverOutcome::Accepted
+        } else {
+            DeliverOutcome::Rejected
         }
-        valid
     }
 
     /// Let the consumer know that the data is not being fetched anymore.

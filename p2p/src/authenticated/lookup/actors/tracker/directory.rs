@@ -280,6 +280,11 @@ impl<E: Spawner + Rng + Clock + RuntimeMetrics, C: PublicKey> Directory<E, C> {
             .try_set(blocked_until.epoch_millis());
     }
 
+    /// Hot-update the duration used when blocking peers.
+    pub fn set_block_duration(&mut self, duration: Duration) {
+        self.block_duration = duration;
+    }
+
     // ---------- Getters ----------
 
     /// Returns all peers that are part of at least one peer set.

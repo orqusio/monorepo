@@ -13,7 +13,7 @@ use commonware_utils::{
     channel::{fallible::FallibleExt, mpsc, oneshot},
     ordered::{Map, Set},
 };
-use std::net::IpAddr;
+use std::{net::IpAddr, time::Duration};
 
 /// Messages that can be sent to the tracker actor.
 #[derive(Debug)]
@@ -43,6 +43,9 @@ pub enum Message<C: PublicKey> {
     /// Block a peer, disconnecting them if currently connected and preventing future connections
     /// for as long as the peer remains in at least one active peer set.
     Block { public_key: C },
+
+    /// Update how long blocked peers must wait before reconnecting.
+    SetBlockDuration { duration: Duration },
 
     // ---------- Used by peer ----------
     /// Notify the tracker that a peer has been successfully connected.
@@ -240,5 +243,14 @@ impl<C: PublicKey> crate::Blocker for Oracle<C> {
 
     async fn block(&mut self, public_key: Self::PublicKey) {
         self.sender.0.send_lossy(Message::Block { public_key });
+    }
+}
+
+impl<C: PublicKey> Oracle<C> {
+    /// Hot-update the duration blocked peers must wait before reconnecting.
+    pub fn set_block_duration(&mut self, duration: Duration) {
+        self.sender
+            .0
+            .send_lossy(Message::SetBlockDuration { duration });
     }
 }

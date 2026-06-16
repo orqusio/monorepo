@@ -2,7 +2,7 @@ use crate::types::{Height, Round};
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt, Write};
 use commonware_cryptography::Digest;
-use commonware_resolver::{p2p::Producer, Consumer};
+use commonware_resolver::{p2p::Producer, Consumer, DeliverOutcome};
 use commonware_utils::{
     channel::{mpsc, oneshot},
     Span,
@@ -27,8 +27,8 @@ pub enum Message<D: Digest> {
         key: Request<D>,
         /// The value being delivered.
         value: Bytes,
-        /// A channel to send the result of the delivery (true for success).
-        response: oneshot::Sender<bool>,
+        /// A channel to send the result of the delivery.
+        response: oneshot::Sender<DeliverOutcome>,
     },
     /// A request to produce a value for a given key.
     Produce {
@@ -60,7 +60,7 @@ impl<D: Digest> Consumer for Handler<D> {
     type Value = Bytes;
     type Failure = ();
 
-    async fn deliver(&mut self, key: Self::Key, value: Self::Value) -> bool {
+    async fn deliver(&mut self, key: Self::Key, value: Self::Value) -> DeliverOutcome {
         let (response, receiver) = oneshot::channel();
         if self
             .sender
@@ -73,9 +73,9 @@ impl<D: Digest> Consumer for Handler<D> {
             .is_err()
         {
             error!("failed to send deliver message to actor: receiver dropped");
-            return false;
+            return DeliverOutcome::Deferred;
         }
-        receiver.await.unwrap_or(false)
+        receiver.await.unwrap_or(DeliverOutcome::Deferred)
     }
 
     async fn failed(&mut self, _: Self::Key, _: Self::Failure) {

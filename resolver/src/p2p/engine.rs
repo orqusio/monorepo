@@ -4,7 +4,7 @@ use super::{
     ingress::{FetchRequest, Mailbox, Message},
     metrics, wire, Producer,
 };
-use crate::Consumer;
+use crate::{Consumer, DeliverOutcome};
 use bytes::Bytes;
 use commonware_cryptography::PublicKey;
 use commonware_macros::select_loop;
@@ -423,23 +423,24 @@ impl<
             return;
         };
 
-        // The peer had the data, so we can deliver it to the consumer
-        if self.consumer.deliver(key.clone(), response).await {
-            // Record metrics
-            self.metrics.fetch.inc(Status::Success);
-            self.fetch_timers.remove(&key).unwrap(); // must exist in the map, records metric on drop
-
-            // Clear all targets for this key
-            self.fetcher.clear_targets(&key);
-            return;
+        match self.consumer.deliver(key.clone(), response).await {
+            DeliverOutcome::Accepted => {
+                self.metrics.fetch.inc(Status::Success);
+                self.fetch_timers.remove(&key).unwrap(); // must exist in the map, records metric on drop
+                self.fetcher.clear_targets(&key);
+            }
+            DeliverOutcome::Rejected => {
+                commonware_p2p::block!(self.blocker, peer.clone(), "invalid data received");
+                self.fetcher.block(peer);
+                self.metrics.fetch.inc(Status::Failure);
+                self.fetcher.add_retry(key);
+            }
+            DeliverOutcome::Deferred => {
+                trace!(?peer, ?id, "verification deferred; retrying without blocking peer");
+                self.metrics.fetch.inc(Status::Failure);
+                self.fetcher.add_retry(key);
+            }
         }
-
-        // If the data is invalid, we need to block the peer and try again
-        // (blocking the peer also removes any targets associated with it)
-        commonware_p2p::block!(self.blocker, peer.clone(), "invalid data received");
-        self.fetcher.block(peer);
-        self.metrics.fetch.inc(Status::Failure);
-        self.fetcher.add_retry(key);
     }
 
     /// Handle a network response from a peer that did not have the data.

@@ -32,6 +32,7 @@ rand_core.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+alloy-primitives = { version = "1.5", default-features = false, features = ["std", "k256"] }
 commonware-macros = { workspace = true, features = ["std"] }
 commonware-p2p.workspace = true
 commonware-parallel = { workspace = true, features = ["std"] }

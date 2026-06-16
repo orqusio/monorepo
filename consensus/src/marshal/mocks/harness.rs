@@ -349,6 +349,9 @@ impl TestHarness for StandardHarness {
             value_write_buffer: NZUsize!(1024),
             page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
             strategy: Sequential,
+            emergency_qc_verifier: (),
+            epoch_length: 0,
+            recovery_notifier: (),
         };
 
         let control = oracle.control(validator.clone());
@@ -580,6 +583,9 @@ impl TestHarness for StandardHarness {
             value_write_buffer: NZUsize!(1024),
             page_cache: page_cache.clone(),
             strategy: Sequential,
+            emergency_qc_verifier: (),
+            epoch_length: 0,
+            recovery_notifier: (),
         };
 
         let backfill = control.register(0, TEST_QUOTA).await.unwrap();
@@ -1112,6 +1118,9 @@ impl TestHarness for CodingHarness {
             value_write_buffer: NZUsize!(1024),
             page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
             strategy: Sequential,
+            emergency_qc_verifier: (),
+            epoch_length: 0,
+            recovery_notifier: (),
         };
 
         let control = oracle.control(validator.clone());
@@ -1371,6 +1380,9 @@ impl TestHarness for CodingHarness {
             value_write_buffer: NZUsize!(1024),
             page_cache: page_cache.clone(),
             strategy: Sequential,
+            emergency_qc_verifier: (),
+            epoch_length: 0,
+            recovery_notifier: (),
         };
 
         let backfill = control.register(0, TEST_QUOTA).await.unwrap();

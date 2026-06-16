@@ -281,6 +281,9 @@ where
                 max_repair: MAX_REPAIR,
                 max_pending_acks: MAX_PENDING_ACKS,
                 strategy: config.strategy.clone(),
+                emergency_qc_verifier: (),
+                epoch_length: 0,
+                recovery_notifier: (),
             },
         )
         .await;

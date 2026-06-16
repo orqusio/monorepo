@@ -10,6 +10,14 @@ use tokio::{
 };
 use tracing::warn;
 
+/// Applies `SO_LINGER` via Tokio's API until we migrate to a non-blocking setter.
+#[allow(deprecated)]
+fn set_so_linger(stream: &TcpStream, so_linger: Duration) {
+    if let Err(err) = stream.set_linger(Some(so_linger)) {
+        warn!(?err, "failed to set SO_LINGER");
+    }
+}
+
 /// Implementation of [crate::Sink] for the [tokio] runtime.
 pub struct Sink {
     write_timeout: Duration,
@@ -109,9 +117,7 @@ impl crate::Listener for Listener {
 
         // Set SO_LINGER if configured
         if let Some(so_linger) = self.cfg.so_linger {
-            if let Err(err) = stream.set_linger(Some(so_linger)) {
-                warn!(?err, "failed to set SO_LINGER");
-            }
+            set_so_linger(&stream, so_linger);
         }
 
         // Return the sink and stream
@@ -276,9 +282,7 @@ impl crate::Network for Network {
 
         // Set SO_LINGER if configured
         if let Some(so_linger) = self.cfg.so_linger {
-            if let Err(err) = stream.set_linger(Some(so_linger)) {
-                warn!(?err, "failed to set SO_LINGER");
-            }
+            set_so_linger(&stream, so_linger);
         }
 
         // Return the sink and stream

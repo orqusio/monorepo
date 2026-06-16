@@ -260,6 +260,9 @@ impl<E: Spawner + Rng + Clock + RuntimeMetrics, C: Signer> Actor<E, C> {
                     .send_lossy(self.directory.listenable())
                     .await;
             }
+            Message::SetBlockDuration { duration } => {
+                self.directory.set_block_duration(duration);
+            }
             Message::Release { metadata } => {
                 // Clear the peer handle if it exists
                 self.mailboxes.remove(metadata.public_key());

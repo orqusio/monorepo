@@ -72,7 +72,16 @@ use commonware_storage::archive;
 use commonware_utils::{acknowledgement::Exact, Acknowledgement};
 
 mod config;
+mod emergency;
+mod recovery_sync;
 pub use config::Config;
+pub use emergency::EmergencyQcVerifier;
+pub use recovery_sync::{
+    anchor_first_deliver_should_notify, classify_pending_kind, forward_fill_start,
+    is_epoch_boundary, is_recovery_completion_deliver, should_defer_tip_fcu, BoxedNotifyFut,
+    PendingGap, PendingRecoveryKind, RecoveryIdentity, RecoveryNotifyError,
+    RecoverySwitchComplete, RecoverySwitchNotifier, RecoverySyncGate, RecoverySyncGateStatus,
+};
 
 pub mod ancestry;
 pub mod core;

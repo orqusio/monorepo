@@ -47,6 +47,16 @@ stability_scope!(BETA {
     pub trait Block: Heightable + Codec + Digestible + Send + Sync + 'static {
         /// Get the parent block's digest.
         fn parent(&self) -> Self::Digest;
+
+        /// Execution-layer header `extra_data`.
+        fn extra_data(&self) -> &[u8] {
+            &[]
+        }
+
+        /// Execution-layer `parent_hash` header field.
+        fn parent_block_hash(&self) -> Option<&[u8]> {
+            None
+        }
     }
 
     /// CertifiableBlock extends [Block] with consensus context information.

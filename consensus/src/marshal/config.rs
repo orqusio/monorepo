@@ -1,4 +1,5 @@
 use crate::{
+    marshal::{EmergencyQcVerifier, RecoverySwitchNotifier},
     types::{Epoch, Epocher, ViewDelta},
     Block,
 };
@@ -17,12 +18,14 @@ use std::num::{NonZeroU64, NonZeroUsize};
 /// that epoch, the marshal will silently drop the sync request. Callers are
 /// responsible for ensuring both are configured for the full range of heights
 /// they intend to sync.
-pub struct Config<B, P, ES, T>
+pub struct Config<B, P, ES, T, Q = (), RN = ()>
 where
     B: Block,
     P: Provider<Scope = Epoch>,
     ES: Epocher,
     T: Strategy,
+    Q: EmergencyQcVerifier + 'static,
+    RN: RecoverySwitchNotifier + 'static,
 {
     /// Provider for epoch-specific signing schemes.
     ///
@@ -73,4 +76,13 @@ where
 
     /// Strategy for parallel operations.
     pub strategy: T,
+
+    /// Optional recovery QC verifier (Orqus: EL + slot 3/4). Default [`()`] never bypasses BLS.
+    pub emergency_qc_verifier: Q,
+
+    /// Epoch length for boundary detection during gap repair. `0` disables boundary checks.
+    pub epoch_length: u64,
+
+    /// Notifies recovery actor / epoch manager before storing recovery blocks.
+    pub recovery_notifier: RN,
 }

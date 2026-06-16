@@ -2,6 +2,7 @@ use super::Variant;
 use crate::{
     marshal::{
         ancestry::{AncestorStream, BlockProvider},
+        RecoverySwitchComplete, RecoverySyncGateStatus,
         Identifier,
     },
     simplex::types::{Activity, Finalization, Notarization},
@@ -130,6 +131,15 @@ pub(crate) enum Message<S: Scheme, V: Variant> {
     Finalization {
         /// The finalization.
         finalization: Finalization<S, V::Commitment>,
+    },
+    /// Recovery actor reports that `emergency_enter` completed for the given identity.
+    RecoverySwitchComplete {
+        /// Completed recovery switch identity.
+        complete: RecoverySwitchComplete,
+    },
+    /// Query recovery sync gate state (executor Tip FCU deferral).
+    GetRecoverySyncGateStatus {
+        response: oneshot::Sender<RecoverySyncGateStatus>,
     },
 }
 
@@ -308,6 +318,28 @@ impl<S: Scheme, V: Variant> Mailbox<S, V> {
     /// otherwise the prune request is ignored.
     pub async fn prune(&self, height: Height) {
         self.sender.send_lossy(Message::Prune { height }).await;
+    }
+
+    /// Notify marshal that recovery `emergency_enter` completed for the given identity.
+    pub async fn recovery_switch_complete(&self, complete: RecoverySwitchComplete) {
+        self.sender
+            .send_lossy(Message::RecoverySwitchComplete { complete })
+            .await;
+    }
+
+    /// Snapshot of recovery sync gate (awaiting / pending_gap) for executor FCU gating.
+    pub async fn recovery_sync_gate_status(&self) -> RecoverySyncGateStatus {
+        self.sender
+            .request(|response| Message::GetRecoverySyncGateStatus { response })
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Whether Tip / Tip FCU should be deferred for `height` while recovery gap sync is active.
+    pub async fn should_defer_tip_fcu(&self, height: Height) -> bool {
+        self.recovery_sync_gate_status()
+            .await
+            .should_defer_tip_fcu(height.get())
     }
 }
 
