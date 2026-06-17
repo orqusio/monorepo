@@ -327,7 +327,7 @@ impl<S: Scheme, V: Variant> Mailbox<S, V> {
             .await;
     }
 
-    /// Snapshot of recovery sync gate (awaiting / pending_gap) for executor FCU gating.
+    /// Snapshot of recovery sync gate (awaiting / last_failing_height) for executor FCU gating.
     pub async fn recovery_sync_gate_status(&self) -> RecoverySyncGateStatus {
         self.sender
             .request(|response| Message::GetRecoverySyncGateStatus { response })

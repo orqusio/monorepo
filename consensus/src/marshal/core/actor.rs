@@ -7,11 +7,9 @@ use crate::{
     marshal::{
         resolver::handler::{self, Request},
         store::{Blocks, Certificates},
-        forward_fill_start,
-        is_recovery_completion_deliver, should_cache_recovery_out_of_order,
-        should_notify_recovery_execution, should_store_execution_after_switch,
-        should_skip_backward_gap_repair, Config, EmergencyQcVerifier,
-        Identifier as BlockID, PendingGap, RecoveryAwaiting, RecoverySwitchComplete,
+        should_notify_recovery_execution, Config,
+        EmergencyQcVerifier,
+        Identifier as BlockID, RecoveryAwaiting, RecoverySwitchComplete,
         RecoverySwitchNotifier, RecoverySyncGate, Update,
     },
     simplex::{
@@ -69,12 +67,6 @@ enum RecoveryDeliverDecision {
     StoreOnly,
     /// Do not store; resolver should retry (awaiting switch, notify sent).
     Deferred,
-}
-
-/// Whether recovery evaluation runs on a network deliver or sequential catch-up.
-enum RecoveryDeliverKind {
-    NetworkDeliver,
-    SequentialCatchUp,
 }
 
 /// A parsed-but-unverified resolver delivery awaiting batch certificate verification.
@@ -436,16 +428,9 @@ where
                 .await;
         }
 
-        // Attempt to dispatch the next finalized block to the application, if it is ready.
-        self.try_dispatch_blocks(&mut application).await;
-
-        // Attempt to repair any gaps in the finalized blocks archive, if there are any.
-        if self
-            .try_repair_gaps(&mut buffer, &mut resolver, &mut application)
-            .await
-        {
-            self.sync_finalized().await;
-        }
+        // Attempt to dispatch and repair any gap at the next expected height.
+        self.drive_dispatch_pipeline(&mut application, &mut buffer, &mut resolver)
+            .await;
 
         select_loop! {
             self.context,
@@ -519,8 +504,9 @@ where
                     return;
                 }
 
-                // Fill the pipeline
-                self.try_dispatch_blocks(&mut application).await;
+                // Fill the pipeline; repair/fetch if the next height is missing from archive.
+                self.drive_dispatch_pipeline(&mut application, &mut buffer, &mut resolver)
+                    .await;
             },
             // Handle consensus inputs before backfill or resolver traffic
             Some(message) = self.mailbox.recv() else {
@@ -748,9 +734,10 @@ where
                         self.pending_switch_complete = Some(complete);
                     }
                     Message::GetRecoverySyncGateStatus { response } => {
-                        let mut status = self.recovery_gate.status();
-                        status.last_processed_height = self.last_processed_height.get();
-                        response.send_lossy(status);
+                        response.send_lossy(
+                            self.recovery_gate
+                                .status_at(self.last_processed_height.get()),
+                        );
                     }
                 }
             },
@@ -764,7 +751,8 @@ where
                         .await;
                     self.try_advance_recovery_at_next_height()
                         .await;
-                    self.try_dispatch_blocks(&mut application).await;
+                    self.drive_dispatch_pipeline(&mut application, &mut buffer, &mut resolver)
+                        .await;
                 }
 
                 // Drain up to max_repair messages: blocks handled immediately,
@@ -815,6 +803,9 @@ where
                 if needs_sync {
                     self.sync_finalized().await;
                 }
+
+                self.drive_dispatch_pipeline(&mut application, &mut buffer, &mut resolver)
+                    .await;
 
                 // Handle produce requests in parallel.
                 join_all(
@@ -1220,11 +1211,7 @@ where
                     let height = block.height();
                     if self.emergency_qc_verifier.has_recovery_slots(extra) {
                         match self
-                            .evaluate_recovery_finalized(
-                                extra,
-                                height,
-                                RecoveryDeliverKind::NetworkDeliver,
-                            )
+                            .evaluate_recovery_finalized(extra, height)
                             .await
                         {
                             RecoveryDeliverDecision::Deferred => {
@@ -1240,24 +1227,6 @@ where
                     let round = finalization.round();
                     let digest = block.digest();
                     debug!(?round, %height, "received finalization");
-
-                    let completion = !self.recovery_gate.awaiting.is_some()
-                        && self.recovery_gate.pending_gap.as_ref().is_some_and(|gap| {
-                            is_recovery_completion_deliver(
-                                height.get(),
-                                self.last_processed_height.get(),
-                                gap,
-                            )
-                        });
-                    if completion {
-                        info!(
-                            target: "marshal.emergency",
-                            %height,
-                            last_processed = %self.last_processed_height,
-                            "recovery completion deliver: storing anchor block, clearing pending_gap",
-                        );
-                        self.recovery_gate.pending_gap = None;
-                    }
 
                     wrote |= self
                         .store_finalization(
@@ -1314,11 +1283,11 @@ where
         wrote
     }
 
+    /// Recovery deliver gate: init session, cache out-of-order, notify execution@F, or store.
     async fn evaluate_recovery_finalized(
         &mut self,
         extra: &[u8],
         height: Height,
-        kind: RecoveryDeliverKind,
     ) -> RecoveryDeliverDecision {
         if self.recovery_gate.awaiting.is_some() {
             return RecoveryDeliverDecision::Deferred;
@@ -1331,63 +1300,32 @@ where
             .parse_recovery_failing_height(extra)
             .unwrap_or(height_u);
 
-        if self.recovery_gate.pending_gap.as_ref().is_some_and(|gap| {
-            is_recovery_completion_deliver(height_u, last_processed, gap)
-        }) {
-            return RecoveryDeliverDecision::Store;
+        if self.recovery_gate.recovery_block_height.is_none() {
+            self.recovery_gate.recovery_block_height = Some(height_u);
+            self.recovery_gate.last_failing_height = Some(failing_height);
         }
 
-        if self.recovery_gate.pending_gap.as_ref().is_some_and(|gap| {
-            should_store_execution_after_switch(
-                gap.switch_completed,
-                last_processed,
-                height_u,
-                gap.failing_height,
-            )
-        }) {
-            return RecoveryDeliverDecision::Store;
-        }
-
-        if matches!(kind, RecoveryDeliverKind::NetworkDeliver)
-            && should_cache_recovery_out_of_order(
-                last_processed,
-                height_u,
-                self.recovery_gate.pending_gap.is_some(),
-            )
-        {
+        if height_u > last_processed.saturating_add(1) {
             return RecoveryDeliverDecision::StoreOnly;
         }
 
-        if self.recovery_gate.pending_gap.is_none() {
-            self.recovery_gate.pending_gap = Some(PendingGap {
-                recovery_target: height_u,
-                failing_height,
-                fill_start: forward_fill_start(
-                    last_processed,
-                    last_processed.saturating_add(1).max(1),
-                    failing_height,
-                ),
-                switch_completed: false,
-            });
-
-            // Cold start: local prefix has not reached F - 1 yet.
-            if last_processed != failing_height.saturating_sub(1) {
-                return RecoveryDeliverDecision::StoreOnly;
+        if should_notify_recovery_execution(last_processed, height_u, failing_height) {
+            if self.recovery_gate.recent_switch_failing == Some(failing_height) {
+                return RecoveryDeliverDecision::Store;
             }
-        }
 
-        if !should_notify_recovery_execution(last_processed, height_u, failing_height) {
-            return RecoveryDeliverDecision::StoreOnly;
-        }
-
-        let notify_result = self
-            .recovery_notifier
-            .notify_execution_recovery(extra, height_u)
-            .await;
-
-        if notify_result.is_ok() {
             self.recovery_gate.awaiting = Some(RecoveryAwaiting);
-        } else {
+            let notify_result = self
+                .recovery_notifier
+                .notify_execution_recovery(extra, height_u)
+                .await;
+
+            if notify_result.is_ok() {
+                self.recovery_gate.on_switch_complete(failing_height);
+                return RecoveryDeliverDecision::Store;
+            }
+
+            self.recovery_gate.awaiting = None;
             warn!(
                 target: "marshal.emergency",
                 %height_u,
@@ -1395,13 +1333,13 @@ where
                 ?notify_result,
                 "recovery notify failed; deferring deliver",
             );
+            return RecoveryDeliverDecision::Deferred;
         }
 
-        RecoveryDeliverDecision::Deferred
+        RecoveryDeliverDecision::StoreOnly
     }
 
-    /// After `last_processed` advances, run recovery notify for the next height if
-    /// that block was previously cached out-of-order in the archive.
+    /// Re-evaluate cached recovery at `last_processed + 1` after sequential advance.
     async fn try_advance_recovery_at_next_height(&mut self) {
         if self.recovery_gate.awaiting.is_some() {
             return;
@@ -1414,24 +1352,8 @@ where
         if !self.emergency_qc_verifier.has_recovery_slots(extra) {
             return;
         }
-        let height_u = next.get();
-        if matches!(
-            self.evaluate_recovery_finalized(
-                extra,
-                next,
-                RecoveryDeliverKind::SequentialCatchUp,
-            )
-            .await,
-            RecoveryDeliverDecision::Store
-        ) {
-            info!(
-                target: "marshal.emergency",
-                %height_u,
-                last_processed = %self.last_processed_height,
-                "recovery completion at sequential catch-up; clearing pending_gap",
-            );
-            self.recovery_gate.pending_gap = None;
-        }
+
+        let _ = self.evaluate_recovery_finalized(extra, next).await;
     }
 
     async fn schedule_recovery_fetch<Res>(
@@ -1464,27 +1386,23 @@ where
     {
         let failing_height = complete.identity.failing_height;
         let recovery_nonce = complete.identity.nonce;
-        self.recovery_gate.on_switch_complete();
+        // Idempotent: evaluate may have already applied the switch before storing @F.
+        self.recovery_gate.on_switch_complete(failing_height);
         info!(
             target: "marshal.emergency",
             failing_height,
             recovery_nonce,
-            pending_recovery_target = ?self.recovery_gate.pending_gap.as_ref().map(|g| g.recovery_target),
-            "RecoverySwitchComplete: cleared awaiting, scheduling continuation fetch",
+            recovery_block_height = ?self.recovery_gate.recovery_block_height,
+            last_failing_height = ?self.recovery_gate.last_failing_height,
+            "RecoverySwitchComplete",
         );
-        if let Some(gap) = self.recovery_gate.pending_gap.clone() {
-            let from = self
-                .recovery_gate
-                .continuation_fetch_start(self.last_processed_height.get());
-            let to = gap.recovery_target;
-            info!(
-                target: "marshal.emergency",
-                fetch_from = from,
-                fetch_to_exclusive = to,
-                recovery_target = gap.recovery_target,
-                "RecoverySwitchComplete: scheduling continuation fetch",
-            );
-            self.schedule_recovery_fetch(resolver, from, to).await;
+        if self.recovery_gate.last_failing_height.is_some() {
+            if let Some(target) = self.recovery_gate.recovery_block_height {
+                let from = self.last_processed_height.get().saturating_add(1);
+                if from < target {
+                    self.schedule_recovery_fetch(resolver, from, target).await;
+                }
+            }
         }
     }
 
@@ -1551,16 +1469,21 @@ where
     ///   handle_block_processed   ->  update_processed_height  ->  metadata buffered
     ///   application_metadata.sync ->  metadata durable
     /// ```
+    /// Dispatch sequential finalized blocks until the pipeline is full or the next
+    /// height is missing from the archive.
+    ///
+    /// Returns `Some(height)` when dispatch stalled because `height` is not in
+    /// `finalized_blocks` (pipeline still has capacity).
     async fn try_dispatch_blocks(
         &mut self,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
-    ) {
+    ) -> Option<Height> {
         while self.pending_acks.has_capacity() {
             let next_height = self
                 .pending_acks
                 .next_dispatch_height(self.last_processed_height);
             let Some(block) = self.get_finalized_block(next_height).await else {
-                return;
+                return Some(next_height);
             };
             assert_eq!(
                 block.height(),
@@ -1579,6 +1502,62 @@ where
                 receiver: ack_waiter,
             });
         }
+        None
+    }
+
+    /// After dispatch, repair or fetch when the next expected height is absent from archive.
+    async fn drive_dispatch_pipeline<Buf, Res>(
+        &mut self,
+        application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
+        buffer: &mut Buf,
+        resolver: &mut Res,
+    ) where
+        Buf: Buffer<V>,
+        Res: Resolver<Key = Request<V::Commitment>>,
+    {
+        let Some(missing) = self.try_dispatch_blocks(application).await else {
+            return;
+        };
+
+        let have_finalization = self
+            .get_finalization_by_height(missing)
+            .await
+            .is_some();
+        info!(
+            target: "marshal.emergency",
+            %missing,
+            have_finalization,
+            last_processed = %self.last_processed_height,
+            marshal_tip = %self.tip,
+            recovery_block_height = ?self.recovery_gate.recovery_block_height,
+            last_failing_height = ?self.recovery_gate.last_failing_height,
+            "dispatch stalled: missing finalized block in archive; driving gap repair",
+        );
+
+        if have_finalization {
+            if let Some(finalization) = self.get_finalization_by_height(missing).await {
+                resolver
+                    .fetch(Request::<V::Commitment>::Block(
+                        finalization.proposal.payload,
+                    ))
+                    .await;
+            }
+        }
+
+        if self
+            .try_repair_gaps(buffer, resolver, application)
+            .await
+        {
+            self.sync_finalized().await;
+        }
+
+        if self.try_dispatch_blocks(application).await.is_some() {
+            debug!(
+                target: "marshal.emergency",
+                %missing,
+                "dispatch still stalled after gap repair",
+            );
+        }
     }
 
     /// Handle acknowledgement from the application that a block has been processed.
@@ -1594,6 +1573,22 @@ where
     ) {
         // Update the processed height (buffered, not synced)
         self.update_processed_height(height, resolver).await;
+
+        if self
+            .recovery_gate
+            .recovery_block_height
+            .is_some_and(|target| height.get() >= target)
+        {
+            self.recovery_gate.recovery_block_height = None;
+        }
+
+        if self
+            .recovery_gate
+            .recent_switch_failing
+            .is_some_and(|f| height.get() >= f)
+        {
+            self.recovery_gate.recent_switch_failing = None;
+        }
 
         // Cancel any useless requests
         resolver
@@ -1634,7 +1629,12 @@ where
         finalization: Finalization<P::Scheme, V::Commitment>,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
     ) {
-        if self.recovery_gate.pending_gap.is_none() || height <= self.tip {
+        if !self
+            .recovery_gate
+            .recovery_block_height
+            .is_some_and(|target| self.last_processed_height.get() < target)
+            || height <= self.tip
+        {
             return;
         }
         let digest = V::commitment_to_inner(finalization.proposal.payload);
@@ -1783,7 +1783,7 @@ where
                 .await;
         }
         buffer.finalized(commitment).await;
-        self.try_dispatch_blocks(application).await;
+        let _ = self.try_dispatch_blocks(application).await;
 
         true
     }
@@ -1795,15 +1795,16 @@ where
         digest: <V::Block as Digestible>::Digest,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
     ) {
-        let mut gate = self.recovery_gate.status();
-        gate.last_processed_height = self.last_processed_height.get();
+        let gate = self
+            .recovery_gate
+            .status_at(self.last_processed_height.get());
         if gate.should_defer_tip_fcu(height.get()) {
             info!(
                 target: "marshal.emergency",
                 %height,
                 awaiting = gate.awaiting,
-                pending_recovery_target = ?gate.pending_recovery_target,
-                pending_failing_height = ?gate.pending_failing_height,
+                recovery_block_height = ?gate.recovery_block_height,
+                last_failing_height = ?gate.last_failing_height,
                 last_processed = %gate.last_processed_height,
                 marshal_tip = %self.tip,
                 "deferring Update::Tip during recovery sync gate",
@@ -1927,10 +1928,10 @@ where
             let gap_start = gap_start.map(Height::next).unwrap_or(start);
 
             // Iterate backwards, repairing blocks as we go.
-            if should_skip_backward_gap_repair(self.recovery_gate.pending_gap.is_some()) {
+            if self.recovery_gate.last_failing_height.is_some() {
                 debug!(
                     height = %gap_end,
-                    "skipping backward gap repair during recovery catch-up",
+                    "skipping backward gap repair until anchor execution switch",
                 );
                 break 'cache_repair;
             }
