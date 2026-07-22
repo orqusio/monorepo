@@ -336,6 +336,8 @@ cfg_if::cfg_if! {
         mod actors;
         pub mod config;
         pub use config::Config;
+        pub mod cross_zone_hint;
+        pub use cross_zone_hint::CrossZoneFinalizationHintSink;
         mod engine;
         pub use engine::Engine;
         mod metrics;

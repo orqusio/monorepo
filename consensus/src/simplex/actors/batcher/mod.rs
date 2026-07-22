@@ -4,18 +4,20 @@ mod round;
 mod verifier;
 
 use crate::{
+    simplex::{scheme::Scheme, CrossZoneFinalizationHintSink},
     types::{Epoch, ViewDelta},
     Reporter,
 };
-pub use actor::Actor;
-use commonware_cryptography::certificate::Scheme;
+use commonware_cryptography::Digest;
 use commonware_p2p::Blocker;
 use commonware_parallel::Strategy;
+pub use actor::Actor;
 pub use ingress::{Mailbox, Message};
 pub use round::Round;
 pub use verifier::Verifier;
 
-pub struct Config<S: Scheme, B: Blocker, R: Reporter, T: Strategy> {
+pub struct Config<S: Scheme<D>, B: Blocker<PublicKey = S::PublicKey>, D: Digest, R: Reporter, T: Strategy>
+{
     pub scheme: S,
 
     pub blocker: B,
@@ -28,6 +30,8 @@ pub struct Config<S: Scheme, B: Blocker, R: Reporter, T: Strategy> {
     pub skip_timeout: ViewDelta,
     pub epoch: Epoch,
     pub mailbox_size: usize,
+    /// Optional sink for unverified cross-zone finalization hints (external recovery catch-up).
+    pub cross_zone_finalization_hint: Option<CrossZoneFinalizationHintSink<S, D>>,
 }
 
 #[cfg(test)]
@@ -165,6 +169,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -330,6 +335,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -488,6 +494,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -636,6 +643,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -829,6 +837,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -1041,6 +1050,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -1170,6 +1180,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -1301,6 +1312,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(skip_timeout),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -1459,6 +1471,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(skip_timeout),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -1585,6 +1598,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -1719,6 +1733,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -1855,6 +1870,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -2054,6 +2070,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(batcher_context.clone(), batcher_cfg);
 
@@ -2286,6 +2303,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 
@@ -2503,6 +2521,7 @@ mod tests {
                 skip_timeout: ViewDelta::new(5),
                 epoch,
                 mailbox_size: 128,
+                cross_zone_finalization_hint: None,
             };
             let (batcher, mut batcher_mailbox) = Actor::new(context.clone(), batcher_cfg);
 

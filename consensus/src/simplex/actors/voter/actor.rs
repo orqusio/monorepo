@@ -117,6 +117,9 @@ pub struct Actor<
     mailbox_receiver: mpsc::Receiver<Message<S, D>>,
 
     outbound_messages: Family<Outbound, Counter>,
+    notarize_latency: Histogram,
+    finalize_latency: Histogram,
+    certify_latency: Histogram,
     notarization_latency: Histogram,
     finalization_latency: Histogram,
 }
@@ -151,6 +154,12 @@ impl<
         let outbound_messages = Family::<Outbound, Counter>::default();
         let notarization_latency = Histogram::new(LATENCY);
         let finalization_latency = Histogram::new(LATENCY);
+
+        let notarize_latency = Histogram::new(LATENCY);
+        let finalize_latency = Histogram::new(LATENCY);
+        let certify_latency =Histogram::new(LATENCY);
+
+
         context.register(
             "outbound_messages",
             "number of outbound messages",
@@ -166,6 +175,23 @@ impl<
             "finalization latency",
             finalization_latency.clone(),
         );
+
+        context.register(
+            "notarize_latency",
+            "Notarize latency",
+            notarize_latency.clone(),
+        );
+        context.register(
+            "finalize_latency",
+            "finalize latency",
+            finalize_latency.clone(),
+        );
+        context.register(
+            "certify_latency",
+            "certify_latency latency",
+            certify_latency.clone(),
+        );
+        
 
         // Initialize store
         let (mailbox_sender, mailbox_receiver) = mpsc::channel(cfg.mailbox_size);
@@ -203,6 +229,9 @@ impl<
                 mailbox_receiver,
 
                 outbound_messages,
+                notarize_latency,
+                finalize_latency,
+                certify_latency,
                 notarization_latency,
                 finalization_latency,
             },
@@ -452,6 +481,10 @@ impl<
     ) -> Option<Notarization<S, D>> {
         // Get the notarization before advancing state
         let notarization = self.state.certified(view, success)?;
+        // Only record latency if we are the current leader.
+        if let Some(elapsed) = self.leader_elapsed(view) {
+            self.certify_latency.observe(elapsed);
+        }
 
         // Persist certification result for recovery
         let artifact = Artifact::Certification(Rnd::new(self.state.epoch(), view), success);
@@ -504,6 +537,11 @@ impl<
         );
         self.broadcast_vote(vote_sender, Vote::Notarize(notarize))
             .await;
+
+         // Only the leader sees an unbiased latency sample, so record it now.
+         if let Some(elapsed) = self.leader_elapsed(view) {
+            self.notarize_latency.observe(elapsed);
+        }
     }
 
     /// Share a notarization certificate once we can assemble it locally.
@@ -518,11 +556,6 @@ impl<
         let Some(notarization) = self.state.broadcast_notarization(view) else {
             return;
         };
-
-        // Only the leader sees an unbiased latency sample, so record it now.
-        if let Some(elapsed) = self.leader_elapsed(view) {
-            self.notarization_latency.observe(elapsed);
-        }
 
         // Tell the resolver this view is complete so it can stop requesting it.
         // Skip if the resolver just sent us this certificate (avoid boomerang).
@@ -546,6 +579,11 @@ impl<
         self.reporter
             .report(Activity::Notarization(notarization))
             .await;
+
+        // Only the leader sees an unbiased latency sample, so record it now.
+        if let Some(elapsed) = self.leader_elapsed(view) {
+            self.notarization_latency.observe(elapsed);
+        }
     }
 
     /// Broadcast a nullify vote for `view` if the state machine allows it.
@@ -631,6 +669,11 @@ impl<
         );
         self.broadcast_vote(vote_sender, Vote::Finalize(finalize))
             .await;
+        
+        // Only record latency if we are the current leader.
+        if let Some(elapsed) = self.leader_elapsed(view) {
+            self.finalize_latency.observe(elapsed);
+        }
     }
 
     /// Share a finalization certificate and notify observers of the new height.
@@ -645,11 +688,6 @@ impl<
         let Some(finalization) = self.state.broadcast_finalization(view) else {
             return;
         };
-
-        // Only record latency if we are the current leader.
-        if let Some(elapsed) = self.leader_elapsed(view) {
-            self.finalization_latency.observe(elapsed);
-        }
 
         // Tell the resolver this view is complete so it can stop requesting it.
         // Skip if the resolver just sent us this certificate (avoid boomerang).
@@ -673,6 +711,11 @@ impl<
         self.reporter
             .report(Activity::Finalization(finalization))
             .await;
+            
+        // Only record latency if we are the current leader.
+        if let Some(elapsed) = self.leader_elapsed(view) {
+            self.finalization_latency.observe(elapsed);
+        }
     }
 
     /// Emits any votes or certificates that became available for `view`.

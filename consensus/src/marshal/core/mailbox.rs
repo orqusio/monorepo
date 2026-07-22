@@ -132,6 +132,10 @@ pub(crate) enum Message<S: Scheme, V: Variant> {
         /// The finalization.
         finalization: Finalization<S, V::Commitment>,
     },
+    /// Unverified finalization from another consensus zone (external recovery signal).
+    CrossZoneFinalizationHint {
+        finalization: Finalization<S, V::Commitment>,
+    },
     /// Recovery actor reports that `emergency_enter` completed for the given identity.
     RecoverySwitchComplete {
         /// Completed recovery switch identity.
@@ -324,6 +328,16 @@ impl<S: Scheme, V: Variant> Mailbox<S, V> {
     pub async fn recovery_switch_complete(&self, complete: RecoverySwitchComplete) {
         self.sender
             .send_lossy(Message::RecoverySwitchComplete { complete })
+            .await;
+    }
+
+    /// Forward an unverified cross-zone finalization hint to marshal (external recovery catch-up).
+    pub async fn cross_zone_finalization_hint(
+        &self,
+        finalization: Finalization<S, V::Commitment>,
+    ) {
+        self.sender
+            .send_lossy(Message::CrossZoneFinalizationHint { finalization })
             .await;
     }
 

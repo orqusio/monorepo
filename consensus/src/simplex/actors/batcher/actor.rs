@@ -6,6 +6,7 @@ use crate::{
         metrics::{Inbound, Peer, TimeoutReason},
         scheme::Scheme,
         types::{Activity, Certificate, Vote},
+        CrossZoneFinalizationHintSink,
     },
     types::{Epoch, Participant, View, ViewDelta},
     Epochable, Reporter, Viewable,
@@ -64,6 +65,7 @@ pub struct Actor<
     zone_id: u64,
 
     mailbox_receiver: mpsc::Receiver<Message<S, D>>,
+    cross_zone_finalization_hint: Option<CrossZoneFinalizationHintSink<S, D>>,
 
     added: Counter,
     verified: Counter,
@@ -84,13 +86,13 @@ impl<
     > Actor<E, S, B, D, R, T>
 {
     #[allow(dead_code)]
-    pub fn new(context: E, cfg: Config<S, B, R, T>) -> (Self, Mailbox<S, D>) {
+    pub fn new(context: E, cfg: Config<S, B, D, R, T>) -> (Self, Mailbox<S, D>) {
         Self::new_with_zone_id(context, cfg, 0)
     }
 
     pub fn new_with_zone_id(
         context: E,
-        cfg: Config<S, B, R, T>,
+        cfg: Config<S, B, D, R, T>,
         zone_id: u64,
     ) -> (Self, Mailbox<S, D>) {
         let added = Counter::default();
@@ -155,6 +157,7 @@ impl<
                 zone_id,
 
                 mailbox_receiver: receiver,
+                cross_zone_finalization_hint: cfg.cross_zone_finalization_hint,
 
                 added,
                 verified,
@@ -328,6 +331,11 @@ impl<
 
                 // Skip certificates produced by another consensus zone.
                 if message.zone_id() != self.zone_id {
+                    if let Certificate::Finalization(finalization) = &message {
+                        if let Some(hint) = &self.cross_zone_finalization_hint {
+                            hint.hint(finalization.clone());
+                        }
+                    }
                     trace!(
                         local_zone_id = self.zone_id,
                         message_zone_id = message.zone_id(),

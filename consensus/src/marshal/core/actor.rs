@@ -48,7 +48,7 @@ use pin_project::pin_project;
 use prometheus_client::metrics::gauge::Gauge;
 use rand_core::CryptoRngCore;
 use std::{
-    collections::{btree_map::Entry, BTreeMap, VecDeque},
+    collections::{btree_map::Entry, BTreeMap, HashSet, VecDeque},
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
@@ -255,6 +255,10 @@ where
     recovery_gate: RecoverySyncGate,
     // Deferred recovery switch completion from mailbox (processed on resolver arm)
     pending_switch_complete: Option<RecoverySwitchComplete>,
+    /// Block fetches for cross-zone hints: deliver without storing (tip discovery only).
+    pending_cross_zone_tip_fetches: HashSet<V::Commitment>,
+    /// Highest tip height observed from cross-zone hints.
+    cross_zone_hint_tip_max: Option<u64>,
 
     // ---------- State ----------
     // Last view processed
@@ -371,6 +375,8 @@ where
                 recovery_notifier: config.recovery_notifier,
                 recovery_gate: RecoverySyncGate::default(),
                 pending_switch_complete: None,
+                pending_cross_zone_tip_fetches: HashSet::new(),
+                cross_zone_hint_tip_max: None,
                 last_processed_round: Round::zero(),
                 last_processed_height,
                 pending_acks: PendingAcks::new(config.max_pending_acks.get()),
@@ -546,7 +552,42 @@ where
                         buffer.proposed(round, block).await;
                     }
                     Message::Verified { round, block } => {
-                        self.cache_verified(round, block.digest(), block).await;
+                        let digest = block.digest();
+                        let height = block.height();
+                        self.cache_verified(round, digest, block.clone()).await;
+
+                        // Pair with a cached finalization when verify completes after gossip
+                        // delivered the cert first (simplex live path backfill).
+                        let Some(finalization) = self.cache.get_finalization_for(digest).await
+                        else {
+                            continue;
+                        };
+
+                        let extra = block.extra_data();
+                        if self.emergency_qc_verifier.has_recovery_slots(extra) {
+                            match self.evaluate_recovery_finalized(extra, height).await {
+                                RecoveryDeliverDecision::Deferred => continue,
+                                RecoveryDeliverDecision::StoreOnly
+                                | RecoveryDeliverDecision::Store => {}
+                            }
+                        }
+
+                        if self
+                            .store_finalization(
+                                height,
+                                digest,
+                                block,
+                                Some(finalization),
+                                &mut application,
+                                &mut buffer,
+                            )
+                            .await
+                        {
+                            self.try_repair_gaps(&mut buffer, &mut resolver, &mut application)
+                                .await;
+                            self.sync_finalized().await;
+                            debug!(?round, %height, "verified block paired with cached finalization");
+                        }
                     }
                     Message::Notarization { notarization } => {
                         let round = notarization.round();
@@ -733,6 +774,10 @@ where
                     Message::RecoverySwitchComplete { complete } => {
                         self.pending_switch_complete = Some(complete);
                     }
+                    Message::CrossZoneFinalizationHint { finalization } => {
+                        self.handle_cross_zone_finalization_hint(finalization, &mut resolver)
+                            .await;
+                    }
                     Message::GetRecoverySyncGateStatus { response } => {
                         response.send_lossy(
                             self.recovery_gate
@@ -781,6 +826,7 @@ where
                                     &mut delivers,
                                     &mut application,
                                     &mut buffer,
+                                    &mut resolver,
                                 )
                                 .await;
                         }
@@ -947,7 +993,7 @@ where
     /// immediately. Finalized/Notarized delivers are parsed and structurally
     /// validated, then collected into `delivers` for batch certificate verification.
     /// Returns true if finalization archives were written and need syncing.
-    async fn handle_deliver<Buf: Buffer<V>>(
+    async fn handle_deliver<Buf: Buffer<V>, Res>(
         &mut self,
         key: Request<V::Commitment>,
         value: Bytes,
@@ -955,7 +1001,11 @@ where
         delivers: &mut Vec<PendingVerification<P::Scheme, V>>,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
         buffer: &mut Buf,
-    ) -> bool {
+        resolver: &mut Res,
+    ) -> bool
+    where
+        Res: Resolver<Key = Request<V::Commitment>>,
+    {
         match key {
             Request::Block(commitment) => {
                 let Ok(block) = V::Block::decode_cfg(value.as_ref(), &self.block_codec_config)
@@ -965,6 +1015,13 @@ where
                 };
                 if V::commitment(&block) != commitment {
                     response.send_lossy(false);
+                    return false;
+                }
+
+                if self.pending_cross_zone_tip_fetches.remove(&commitment) {
+                    self.schedule_cross_zone_forward_fetch(block.height().get(), resolver)
+                        .await;
+                    response.send_lossy(true);
                     return false;
                 }
 
@@ -1356,6 +1413,81 @@ where
         let _ = self.evaluate_recovery_finalized(extra, next).await;
     }
 
+    /// External recovery signal: unverified cross-zone finalization from simplex batcher.
+    async fn handle_cross_zone_finalization_hint<Res>(
+        &mut self,
+        finalization: Finalization<P::Scheme, V::Commitment>,
+        resolver: &mut Res,
+    ) where
+        Res: Resolver<Key = Request<V::Commitment>>,
+    {
+        self.recovery_gate.recovery_catchup_active = true;
+        let commitment = finalization.proposal.payload;
+        let zone_id = finalization.zone_id;
+        info!(
+            target: "marshal.emergency",
+            zone_id,
+            ?commitment,
+            last_processed = %self.last_processed_height,
+            "cross-zone finalization hint: fetching block for tip discovery",
+        );
+        self.pending_cross_zone_tip_fetches.insert(commitment);
+        resolver
+            .fetch(Request::<V::Commitment>::Block(commitment))
+            .await;
+    }
+
+    /// After tip block fetch for a cross-zone hint, forward-fill finalized heights.
+    async fn schedule_cross_zone_forward_fetch<Res>(
+        &mut self,
+        tip: u64,
+        resolver: &mut Res,
+    ) where
+        Res: Resolver<Key = Request<V::Commitment>>,
+    {
+        let tip = match self.cross_zone_hint_tip_max {
+            Some(max) => max.max(tip),
+            None => tip,
+        };
+        self.cross_zone_hint_tip_max = Some(tip);
+        let from = self.last_processed_height.get().saturating_add(1);
+        let to_exclusive = tip.saturating_add(1);
+        if from >= to_exclusive {
+            self.maybe_finish_cross_zone_catchup(self.last_processed_height.get());
+            return;
+        }
+        info!(
+            target: "marshal.emergency",
+            from,
+            to_exclusive,
+            tip,
+            last_processed = %self.last_processed_height,
+            "cross-zone hint: scheduling forward recovery fetch",
+        );
+        self.schedule_recovery_fetch(resolver, from, to_exclusive)
+            .await;
+    }
+
+    /// Clear cross-zone catch-up once sequential dispatch has reached the hint tip.
+    fn maybe_finish_cross_zone_catchup(&mut self, last_processed: u64) {
+        if !self.recovery_gate.recovery_catchup_active {
+            return;
+        }
+        let Some(tip) = self.cross_zone_hint_tip_max else {
+            return;
+        };
+        if last_processed < tip {
+            return;
+        }
+        self.recovery_gate.recovery_catchup_active = false;
+        info!(
+            target: "marshal.emergency",
+            last_processed,
+            tip,
+            "cross-zone catch-up complete at hint boundary",
+        );
+    }
+
     async fn schedule_recovery_fetch<Res>(
         &self,
         resolver: &mut Res,
@@ -1573,6 +1705,8 @@ where
     ) {
         // Update the processed height (buffered, not synced)
         self.update_processed_height(height, resolver).await;
+
+        self.maybe_finish_cross_zone_catchup(height.get());
 
         if self
             .recovery_gate
@@ -1908,6 +2042,16 @@ where
         resolver: &mut impl Resolver<Key = Request<V::Commitment>>,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
     ) -> bool {
+        if self.recovery_gate.recovery_catchup_active {
+            debug!(
+                target: "marshal.emergency",
+                last_processed = %self.last_processed_height,
+                hint_tip = ?self.cross_zone_hint_tip_max,
+                "skipping gap repair during cross-zone catch-up",
+            );
+            return false;
+        }
+
         let mut wrote = false;
         let start = self.last_processed_height.next();
         'cache_repair: loop {
@@ -1931,7 +2075,7 @@ where
             if self.recovery_gate.last_failing_height.is_some() {
                 debug!(
                     height = %gap_end,
-                    "skipping backward gap repair until anchor execution switch",
+                    "skipping backward gap repair during recovery catch-up",
                 );
                 break 'cache_repair;
             }

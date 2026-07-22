@@ -30,6 +30,9 @@ pub struct RecoverySyncGate {
     pub last_failing_height: Option<u64>,
     /// Latest execution `F` that finished switch; suppresses duplicate notify until stored.
     pub recent_switch_failing: Option<u64>,
+    /// Cross-zone hint catch-up: marshal skips all gap repair until sequential dispatch
+    /// reaches the hint tip boundary (`last_processed >= cross_zone_hint_tip_max`).
+    pub recovery_catchup_active: bool,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]

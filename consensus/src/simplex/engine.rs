@@ -68,6 +68,7 @@ impl<
                 mailbox_size: cfg.mailbox_size,
                 activity_timeout: cfg.activity_timeout,
                 skip_timeout: cfg.skip_timeout,
+                cross_zone_finalization_hint: cfg.cross_zone_finalization_hint.clone(),
             },
             cfg.zone_id,
         );

@@ -6,6 +6,7 @@ use crate::{
     types::{Epoch, ViewDelta},
     CertifiableAutomaton, Relay, Reporter,
 };
+use super::cross_zone_hint::CrossZoneFinalizationHintSink;
 use commonware_cryptography::{certificate::Scheme, Digest};
 use commonware_p2p::Blocker;
 use commonware_parallel::Strategy;
@@ -75,6 +76,9 @@ pub struct Config<
 
     /// Consensus zone for the running engine.
     pub zone_id: u64,
+
+    /// Optional sink for unverified cross-zone finalization hints (marshal recovery catch-up).
+    pub cross_zone_finalization_hint: Option<CrossZoneFinalizationHintSink<S, D>>,
 
     /// Number of bytes to buffer when replaying during startup.
     pub replay_buffer: NonZeroUsize,
